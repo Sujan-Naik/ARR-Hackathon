@@ -394,9 +394,10 @@ GameObject:
   - component: {fileID: 812353935}
   - component: {fileID: 812353937}
   - component: {fileID: 812353939}
-  - component: {fileID: 812353938}
+  - component: {fileID: 812353940}
+  - component: {fileID: 812353941}
   m_Layer: 5
-  m_Name: RawImage
+  m_Name: CameraView
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -429,27 +430,6 @@ CanvasRenderer:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 812353934}
   m_CullTransparentMesh: 1
---- !u!114 &812353938
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 812353934}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 792e2b57308f7907ab69c100126056ed, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::FaceRecognitionPipeline
-  requestedWidth: 1920
-  requestedHeight: 1080
-  requestedFps: 30
-  faceDetectorAsset: {fileID: 5022602860645237092, guid: ff1774e31ca48866ea42dfc85ea205f5, type: 3}
-  faceEmbedderAsset: {fileID: 5022602860645237092, guid: d479f26dfeb539f8f9c76f4c365790de, type: 3}
-  detectionThreshold: 0.5
-  nmsIouThreshold: 0.45
-  matchThreshold: 0.45
-  recognizeEveryNFrames: 10
 --- !u!114 &812353939
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -477,6 +457,60 @@ MonoBehaviour:
     y: 0
     width: 1
     height: 1
+--- !u!114 &812353940
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 812353934}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 1cff7f19d88476f82aea8e5e3317e07a, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::AR.Vision.VisionPipeline
+  requestedWidth: 1280
+  requestedHeight: 720
+  requestedFps: 10
+  models:
+    face:
+      detector: {fileID: 5022602860645237092, guid: 1b70212b8cd177b58bf6086577b35e54, type: 3}
+      embedder: {fileID: 5022602860645237092, guid: d479f26dfeb539f8f9c76f4c365790de, type: 3}
+      detectionThreshold: 0.3
+      nmsIouThreshold: 0.4
+      matchThreshold: 0.45
+      recognizeEveryNFrames: 10
+    hand:
+      palmDetector: {fileID: 0}
+      handLandmarker: {fileID: 0}
+      palmScoreThreshold: 0.5
+      palmNmsIouThreshold: 0.3
+      handPresenceThreshold: 0.5
+    objects:
+      detector: {fileID: 0}
+      transposedOutput: 0
+      classNames: []
+      scoreThreshold: 0.4
+      nmsIouThreshold: 0.45
+  enableFaces: 1
+  enableHands: 0
+  enableObjects: 0
+  trackIouThreshold: 0.3
+  maxMissedFrames: 5
+  registry: {fileID: 0}
+  drawOverlay: 1
+--- !u!114 &812353941
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 812353934}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 87583d687409631f68ef187f5dbd772d, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::CameraTest
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0
