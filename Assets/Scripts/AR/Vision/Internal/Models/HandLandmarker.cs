@@ -1,4 +1,5 @@
-// Role: 21-joint hand landmark model on a 224x224 crop. Outputs joints, depth, presence and handedness.
+// Role: hand landmark model. Takes a 224x224 NHWC (height, width, channel) crop and returns 21 joints,
+// presence and handedness. Output decoding is ASSUMED. Verify every ASSUMPTION line in Netron before trusting joints.
 using UnityEngine;
 using Unity.InferenceEngine;
 
@@ -6,8 +7,13 @@ namespace AR.Vision
 {
     public sealed class HandLandmarker : System.IDisposable
     {
+        // Matches the model's expected input shape (1, 224, 224, 3).
         public const int InputSize = 224;
         public const int JointCount = 21;
+
+        // Debug output. Set to false to silence the console.
+        private const bool DebugLog = true;
+        private const int LogEveryNCalls = 60;
 
         public struct Pose
         {
@@ -18,7 +24,8 @@ namespace AR.Vision
         }
 
         private readonly Worker landmarker;
-        private readonly float[] input = new float[3 * InputSize * InputSize];
+        private readonly float[] input = new float[InputSize * InputSize * 3];
+        private int callCount;
 
         public HandLandmarker(ModelAsset asset)
         {
@@ -27,9 +34,9 @@ namespace AR.Vision
 
         public Pose Run(VisionFrame frame, Rect cropRegion)
         {
-            frame.FillChw(input, InputSize, cropRegion, 1f / 255f, 0f);   // ASSUMPTION: [0,1] RGB input
+            FillHwc(frame, cropRegion);
 
-            using Tensor<float> t = new Tensor<float>(new TensorShape(1, 3, InputSize, InputSize), input);
+            using Tensor<float> t = new Tensor<float>(new TensorShape(1, InputSize, InputSize, 3), input);
             landmarker.Schedule(t);
 
             // ASSUMPTION: output 0 is [1, 63] holding 21 joints of (x, y, z) in 224-px space.
@@ -53,7 +60,36 @@ namespace AR.Vision
 
             pose.Presence = Geometry.Sigmoid(presence[0]);
             pose.Handedness = Geometry.Sigmoid(handed[0]);
+
+            if (DebugLog && callCount++ % LogEveryNCalls == 0)
+            {
+                Debug.Log(
+                    $"[Landmark] xyzLen={xyz.Length} presenceLen={presence.Length} handedLen={handed.Length} " +
+                    $"rawPresence={presence[0]:0.000} presence={pose.Presence:0.000} " +
+                    $"rawHanded={handed[0]:0.000} handed={pose.Handedness:0.000} " +
+                    $"joint0=({pose.Joints[0].x:0.0}, {pose.Joints[0].y:0.0}) " +
+                    $"crop=({cropRegion.xMin:0.000}, {cropRegion.yMin:0.000}, {cropRegion.width:0.000})");
+            }
+
             return pose;
+        }
+
+        // Writes an NHWC (height, width, channel) crop with RGB values in [0, 1].
+        // ASSUMPTION: the landmark model expects [0, 1] input. Some exports expect [-1, 1] instead.
+        private void FillHwc(VisionFrame frame, Rect cropRegion)
+        {
+            for (int y = 0; y < InputSize; y++)
+            {
+                for (int x = 0; x < InputSize; x++)
+                {
+                    Vector2 uv = Geometry.MapToFrame(new Vector2(x + 0.5f, y + 0.5f), InputSize, cropRegion);
+                    Color c = frame.SampleTopLeft(uv.x, uv.y);
+                    int idx = (y * InputSize + x) * 3;
+                    input[idx + 0] = c.r;
+                    input[idx + 1] = c.g;
+                    input[idx + 2] = c.b;
+                }
+            }
         }
 
         public void Dispose()

@@ -68,6 +68,10 @@ namespace AR.Vision
         private Coroutine startRoutine;
         private int frameCount;
 
+
+	public float FrameAspect => oriented != null ? oriented.width / (float)oriented.height : 1f;
+
+
         void Awake()
         {
             display = GetComponent<RawImage>();
