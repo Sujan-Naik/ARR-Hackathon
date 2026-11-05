@@ -18,6 +18,10 @@ public class StackGame : MonoBehaviour
     [Header("Input")]
     public KeyCode stopKey = KeyCode.Space;    // also: left mouse button
     public KeyCode spawnKey = KeyCode.Return;  // also: right mouse button
+    public KeyCode slowKey = KeyCode.LeftShift; // toggles slow mode on/off
+
+    [Header("Slow Mode")]
+    [Range(0.1f, 1f)] public float slowMultiplier = 0.4f; // 0.4 = 40% of normal speed
 
     [Header("Camera")]
     public Camera cam;
@@ -32,6 +36,7 @@ public class StackGame : MonoBehaviour
     float speed;
     float dir = 1f;        // starts moving left -> right
     bool gameOver;
+    bool slowed;           // toggled by slowKey
 
     void Start()
     {
@@ -57,12 +62,16 @@ public class StackGame : MonoBehaviour
 
     void Update()
     {
+        if (PauseOverlay.IsPaused) return; // ignore all input while paused
+
         if (gameOver)
         {
             if (StopPressed() || SpawnPressed())
                 SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex);
             return;
         }
+
+        if (Input.GetKeyDown(slowKey)) ToggleSlow();
 
         if (movingRow == null)
         {
@@ -71,8 +80,9 @@ public class StackGame : MonoBehaviour
         }
         else
         {
-            // Move the top row back and forth
-            pos += dir * speed * Time.deltaTime;
+            // Move the top row back and forth (slower while slow mode is on)
+            float currentSpeed = slowed ? speed * slowMultiplier : speed;
+            pos += dir * currentSpeed * Time.deltaTime;
             float max = columns - width;
             if (pos > max) { pos = max; dir = -1f; }
             else if (pos < 0f) { pos = 0f; dir = 1f; }
@@ -107,6 +117,13 @@ public class StackGame : MonoBehaviour
         pos = 0f;
         dir = 1f;
         movingRow = BuildRow(width, rowIndex, 0);
+    }
+
+    /// Toggles slow mode on/off. Can also be hooked to a UI Button's OnClick.
+    public void ToggleSlow()
+    {
+        slowed = !slowed;
+        Debug.Log("Slow mode: " + (slowed ? "ON" : "OFF"));
     }
 
     /// Stops the moving block. Can also be hooked to a UI Button's OnClick.
@@ -186,5 +203,8 @@ public class StackGame : MonoBehaviour
             GUI.Label(new Rect(20, 70, 600, 40), "Press " + spawnKey + " to spawn a block", hint);
         else
             GUI.Label(new Rect(20, 70, 600, 40), "Press " + stopKey + " to stop the block", hint);
+
+        GUI.Label(new Rect(20, 100, 600, 40),
+                  "Slow mode (" + slowKey + "): " + (slowed ? "ON" : "OFF"), hint);
     }
 }
