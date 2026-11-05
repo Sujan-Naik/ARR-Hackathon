@@ -4,9 +4,14 @@ A webcam-based vision layer for Unity. It detects and tracks faces, hands, and o
 
 
 Face Detector: https://huggingface.co/globalnebula/insightface-buffalo-l-onnx/blob/main/scrfd_10g.onnx
+
 Face Embedder: https://huggingface.co/globalnebula/insightface-buffalo-l-onnx/blob/main/arcface_w600k_r50.onnx
+
 Palm Detection: https://huggingface.co/opencv/palm_detection_mediapipe/tree/main
+
 Hand Landmarker: https://huggingface.co/opencv/handpose_estimation_mediapipe/blob/main/handpose_estimation_mediapipe_2023feb.onnx
+
+Object Detector: https://huggingface.co/webml/yolov8n/tree/main/onnx
 
 
 ## Contents
