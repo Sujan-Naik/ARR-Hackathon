@@ -1,134 +1,193 @@
-// Role: barber workstation example. Designates a seated client, reads and smooths head pose, gates cutting tools,
-// and draws feedback: a tilting top hat, a wobble meter, a pulsing warning vignette, a banner, and screen shake
-// when the client moves too much. Drawing uses OnGUI, like the pipeline overlay, so no extra Canvas is needed.
 using System;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.UI;
 
 namespace AR.Vision
 {
+    /// <summary>
+    /// ML-powered kids' barber station.
+    /// Uses face/head-pose tracking to guide the seated client and hand/object tracking
+    /// to register safe, toy-scissors snips. All visual output is rendered by uGUI
+    /// Canvas components; this script does not use OnGUI or IMGUI.
+    ///
+    /// Existing project dependencies retained:
+    /// VisionPipeline, Observation, ObservationKind, HeadPose, HeadAngles,
+    /// HandGestures, ItemProfile and PauseOverlay.
+    /// </summary>
     public class BarberStation : MonoBehaviour
     {
         public enum CutState
         {
-            NoClient,      // no client in the seat
-            Reposition,    // head is outside yaw, pitch or roll limits
-            Settling,      // within limits but still moving
-            SafeToCut      // within limits and still for settleSeconds
+            NoClient,
+            Reposition,
+            Settling,
+            SafeToCut
         }
 
+        [Header("Vision")]
         [SerializeField] private VisionPipeline vision;
-        [SerializeField] private float grabRadius = 0.08f;   // normalized frame units
+        [SerializeField, Min(0.001f)] private float grabRadius = 0.08f;
 
         [Header("Client")]
-        [Tooltip("Normalized frame area. A face whose center sits inside this rect becomes the client.")]
+        [Tooltip("A face is selected as the client when its centre is inside this normalized frame rectangle.")]
         [SerializeField] private Rect seatZone = new Rect(0.2f, 0.05f, 0.6f, 0.9f);
-        [Tooltip("Frames the client can be missing before the seat is released.")]
-        [SerializeField] private int framesBeforeClientRelease = 15;
+        [Tooltip("Keep the current client through this many missed vision frames.")]
+        [SerializeField, Min(0)] private int framesBeforeClientRelease = 15;
 
         [Header("Head guidance")]
-        [SerializeField] private float maxYaw = 20f;          // degrees
-        [SerializeField] private float maxPitch = 15f;        // degrees
-        [SerializeField] private float maxRoll = 10f;         // degrees
-        [SerializeField] private float stillSpeed = 8f;       // degrees per second
-        [SerializeField] private float settleSeconds = 0.6f;
+        [SerializeField, Min(1f)] private float maxYaw = 20f;
+        [SerializeField, Min(1f)] private float maxPitch = 15f;
+        [SerializeField, Min(1f)] private float maxRoll = 10f;
+        [SerializeField, Min(0.1f)] private float stillSpeed = 8f;
+        [SerializeField, Min(0.05f)] private float settleSeconds = 0.6f;
         [SerializeField, Range(0.05f, 1f)] private float smoothing = 0.35f;
-        [Tooltip("Deviation above which the client counts as wiggling. 1 is exactly at a limit.")]
-        [SerializeField] private float chaosDeviation = 1.8f;
+        [Tooltip("Deviation above this multiple of the allowed head range activates the playful chaos warning.")]
+        [SerializeField, Min(1f)] private float chaosDeviation = 1.8f;
 
-        [Header("Tools")]
-        [SerializeField] private string[] cuttingLabels = { "scissors", "knife", "razor" };
+        [Header("Detected tools")]
+        [Tooltip("Only these labels count as cutting tools. Keep this to child-safe toy/hair scissors labels.")]
+        [SerializeField] private string[] cuttingLabels = { "scissors", "toy scissors", "toy_scissors", "hair scissors" };
 
-        [Header("Visuals")]
-        [SerializeField] private bool showVisuals = true;
-        [SerializeField] private bool showHat = true;
-        [SerializeField] private bool showWobbleMeter = true;
-        [SerializeField] private float shakeMaxPixels = 14f;
-        [SerializeField] private Color idleColor = new Color(0.75f, 0.75f, 0.8f);
-        [SerializeField] private Color safeColor = new Color(0.2f, 1f, 0.45f);
-        [SerializeField] private Color warnColor = new Color(1f, 0.85f, 0.1f);
-        [SerializeField] private Color chaosColor = new Color(1f, 0.15f, 0.35f);
-        [SerializeField] private Color hatColor = new Color(0.12f, 0.05f, 0.25f);
+        [Header("Haircut game")]
+        [SerializeField, Min(1)] private int snipsToComplete = 8;
+        [SerializeField] private bool resetProgressWhenClientLeaves = true;
+
+        [Header("Canvas UI")]
+        [Tooltip("Canvas RectTransform that directly parents the hat overlay. It should cover the same area as the camera preview.")]
+        [SerializeField] private RectTransform overlayRoot;
+        [Tooltip("Optional root containing the hat and warning-edge images. It can be shaken independently of the HUD.")]
+        [SerializeField] private RectTransform effectsRoot;
+        [SerializeField] private RectTransform hatRoot;
+        [SerializeField] private Image hatBrim;
+        [SerializeField] private Image hatCrown;
+        [SerializeField] private Image hatBand;
+        [SerializeField] private Text bannerText;
+        [SerializeField] private Text guidanceText;
+        [SerializeField] private Text wobbleText;
+        [SerializeField] private Slider yawSlider;
+        [SerializeField] private Slider haircutSlider;
+        [SerializeField] private Text haircutProgressText;
+        [Tooltip("Assign four UI Images: top, bottom, left and right edges.")]
+        [SerializeField] private Image[] vignetteEdges = new Image[4];
+        [SerializeField] private GameObject visualsRoot;
+
+        [Header("Canvas colours")]
+        [SerializeField] private Color idleColor = new Color(0.75f, 0.75f, 0.82f, 1f);
+        [SerializeField] private Color safeColor = new Color(0.2f, 1f, 0.45f, 1f);
+        [SerializeField] private Color warnColor = new Color(1f, 0.78f, 0.12f, 1f);
+        [SerializeField] private Color chaosColor = new Color(1f, 0.15f, 0.35f, 1f);
+        [SerializeField] private Color hatColor = new Color(0.12f, 0.05f, 0.25f, 1f);
+        [SerializeField, Min(0f)] private float shakeMaxCanvasUnits = 8f;
 
         public CutState State { get; private set; } = CutState.NoClient;
         public string Guidance { get; private set; } = "Seat a client to begin";
         public HeadAngles SmoothedHead { get; private set; }
         public bool HasHead { get; private set; }
         public bool HasClient { get; private set; }
-        public Observation Client { get; private set; }     // valid only when HasClient is true
-        public float Deviation { get; private set; }        // 0 centered, 1 at a limit
+        public Observation Client { get; private set; }
+        public float Deviation { get; private set; }
         public bool InChaos { get; private set; }
+        public int SnipsCompleted { get; private set; }
+        public int SnipsRequired => Mathf.Max(1, snipsToComplete);
+        public bool HaircutComplete { get; private set; }
+        public string LastToolName { get; private set; } = string.Empty;
 
         public event Action<CutState> StateChanged;
+        public event Action<string> ToolPickedUp;
+        public event Action<int, int> HaircutProgressChanged;
+        public event Action HaircutCompleted;
 
         private readonly Dictionary<int, Observation> tools = new Dictionary<int, Observation>();
         private readonly Dictionary<int, bool> pinching = new Dictionary<int, bool>();
 
-        private Texture2D pixel;
-        private GUIStyle bannerStyle;
-        private GUIStyle smallStyle;
-
         private float frameAspect = 1f;
         private float stillTimer;
-        private int activeCutterId = -1;
-
         private int clientId = -1;
         private int clientMisses;
+        private bool clientSeenThisFrame;
         private float flash;
-        private Vector2 shakeOffset;
+        private Vector2 effectsBasePosition;
+        private bool effectsBaseCaptured;
+        private bool visionSubscribed;
 
-        void Awake()
+        private void Awake()
         {
-            pixel = new Texture2D(1, 1);
-            pixel.SetPixel(0, 0, Color.white);
-            pixel.Apply();
+            ConfigureHatPieces();
+            ConfigureSliders();
+
+            if (effectsRoot != null)
+            {
+                effectsBasePosition = effectsRoot.anchoredPosition;
+                effectsBaseCaptured = true;
+            }
         }
 
-        void OnEnable()
+        private void OnEnable()
         {
-            vision.ObservationAppeared += OnAppeared;
-            vision.ObservationUpdated += OnUpdated;
-            vision.ObservationLost += OnLost;
+            TrySubscribeToVision();
         }
 
-        void OnDisable()
+        private void OnDisable()
         {
-            vision.ObservationAppeared -= OnAppeared;
-            vision.ObservationUpdated -= OnUpdated;
-            vision.ObservationLost -= OnLost;
+            UnsubscribeFromVision();
+            if (hatRoot != null) hatRoot.gameObject.SetActive(false);
+            if (effectsRoot != null && effectsBaseCaptured)
+                effectsRoot.anchoredPosition = effectsBasePosition;
         }
 
-        void OnDestroy()
+        private void Update()
         {
-            if (pixel != null) Destroy(pixel);
-        }
+            if (PauseOverlay.IsPaused) return;
 
-        void Update()
-        {
-            float dt = Mathf.Max(Time.deltaTime, 1e-4f);
+            float dt = Mathf.Max(Time.deltaTime, 0.0001f);
             flash = Mathf.MoveTowards(flash, 0f, dt * 1.5f);
+            TrySubscribeToVision();
 
-            if (vision == null || !vision.IsReady()) return;
+            if (vision == null || !vision.IsReady())
+            {
+                HasClient = false;
+                ResetHeadTracking();
+                if (resetProgressWhenClientLeaves) ResetHaircutProgress();
+                SetState(CutState.NoClient, "Waiting for the camera and vision model...");
+                RefreshCanvasUI();
+                return;
+            }
+
             frameAspect = vision.FrameAspect;
-
             UpdateClient();
 
             if (!HasClient)
             {
-                ResetClient();
-                SetState(CutState.NoClient, "Seat a client to begin");
+                ResetHeadTracking();
+                if (resetProgressWhenClientLeaves) ResetHaircutProgress();
+                SetState(CutState.NoClient, "Take a seat in the barber chair!");
+                RefreshCanvasUI();
+                return;
+            }
+
+            // Keep the client selected through brief detector dropouts, but never allow
+            // a snip from a stale face observation. Require a fresh face each frame.
+            if (!clientSeenThisFrame)
+            {
+                ResetHeadTracking();
+                SetState(CutState.Settling, "Keep your face in the camera view");
+                RefreshCanvasUI();
                 return;
             }
 
             if (!HeadPose.TryEstimate(Client, frameAspect, out HeadAngles raw))
             {
-                shakeOffset = Vector2.zero;
-                SetState(CutState.Reposition, "Face not clear, ask the client to face the camera");
+                stillTimer = 0f;
+                HasHead = false;
+                SetState(CutState.Reposition, "Face the camera so I can see your hair");
+                RefreshCanvasUI();
                 return;
             }
 
+            bool hadPreviousHead = HasHead;
             HeadAngles previous = SmoothedHead;
-            if (!HasHead)
+            if (!hadPreviousHead)
             {
                 SmoothedHead = raw;
                 HasHead = true;
@@ -142,76 +201,98 @@ namespace AR.Vision
             }
 
             HeadAngles h = SmoothedHead;
-            float speed = AngularDistance(previous, h) / dt;
-
-            // Deviation is the worst axis as a fraction of its limit. It drives color, shake and chaos mode.
+            float angularSpeed = hadPreviousHead ? AngularDistance(previous, h) / dt : 0f;
             Deviation = Mathf.Max(
-                Mathf.Abs(h.Yaw) / maxYaw,
-                Mathf.Abs(h.Pitch) / maxPitch,
-                Mathf.Abs(h.Roll) / maxRoll);
+                Mathf.Abs(h.Yaw) / Mathf.Max(maxYaw, 1f),
+                Mathf.Abs(h.Pitch) / Mathf.Max(maxPitch, 1f),
+                Mathf.Abs(h.Roll) / Mathf.Max(maxRoll, 1f));
             InChaos = Deviation > chaosDeviation;
-
-            float shakeAmount = Mathf.Clamp01((Deviation - 1f) * 1.5f);
-            shakeOffset = UnityEngine.Random.insideUnitCircle * (shakeMaxPixels * shakeAmount);
 
             if (Mathf.Abs(h.Yaw) > maxYaw)
             {
                 stillTimer = 0f;
                 SetState(CutState.Reposition, h.Yaw > 0f
-                    ? "Ask the client to turn a little to the left"
-                    : "Ask the client to turn a little to the right");
-                return;
+                    ? "Turn your face a little to the left"
+                    : "Turn your face a little to the right");
             }
-
-            if (Mathf.Abs(h.Roll) > maxRoll)
+            else if (Mathf.Abs(h.Roll) > maxRoll)
             {
                 stillTimer = 0f;
                 SetState(CutState.Reposition, h.Roll > 0f
-                    ? "Level the head, the client is tilting right"
-                    : "Level the head, the client is tilting left");
-                return;
+                    ? "Try to keep your head level"
+                    : "A tiny tilt the other way, please");
             }
-
-            if (Mathf.Abs(h.Pitch) > maxPitch)
+            else if (Mathf.Abs(h.Pitch) > maxPitch)
             {
                 stillTimer = 0f;
                 SetState(CutState.Reposition, h.Pitch > 0f
-                    ? "Ask the client to lift their chin"
-                    : "Ask the client to lower their chin");
-                return;
+                    ? "Lift your chin a little"
+                    : "Lower your chin a little");
             }
-
-            if (speed > stillSpeed)
+            else if (angularSpeed > stillSpeed)
             {
                 stillTimer = 0f;
-                SetState(CutState.Settling, "Hold still");
-                return;
+                SetState(CutState.Settling, "Hold still like a superstar");
+            }
+            else
+            {
+                stillTimer += dt;
+                SetState(stillTimer >= settleSeconds
+                    ? CutState.SafeToCut
+                    : CutState.Settling,
+                    stillTimer >= settleSeconds ? "Lovely! Ready for a snip" : "Nearly ready... hold still");
             }
 
-            stillTimer += dt;
-            if (stillTimer >= settleSeconds)
-                SetState(CutState.SafeToCut, "Safe to cut");
-            else
-                SetState(CutState.Settling, "Hold still");
+            RefreshCanvasUI();
         }
 
-        // Holds the designated client through brief dropouts, then releases the seat.
-        // A new client is picked only from faces whose center lies in seatZone.
+        /// <summary>Can be called by a UI button to clear the current haircut and start again.</summary>
+        public void RestartHaircut()
+        {
+            ResetHaircutProgress();
+            stillTimer = 0f;
+            Guidance = HasClient ? "Let's start a fresh haircut!" : "Seat a client to begin";
+            RefreshCanvasUI();
+        }
+
+        private void TrySubscribeToVision()
+        {
+            if (visionSubscribed || vision == null) return;
+            vision.ObservationAppeared += OnAppeared;
+            vision.ObservationUpdated += OnUpdated;
+            vision.ObservationLost += OnLost;
+            visionSubscribed = true;
+        }
+
+        private void UnsubscribeFromVision()
+        {
+            if (!visionSubscribed || vision == null) return;
+            vision.ObservationAppeared -= OnAppeared;
+            vision.ObservationUpdated -= OnUpdated;
+            vision.ObservationLost -= OnLost;
+            visionSubscribed = false;
+        }
+
+        // Retain the seated client through brief detection dropouts. New clients are only
+        // selected when their face centre is inside seatZone.
         private void UpdateClient()
         {
+            clientSeenThisFrame = false;
+            int previousClientId = clientId;
+
             if (clientId >= 0)
             {
                 if (TryFindFace(clientId, out Observation found))
                 {
                     Client = found;
                     HasClient = true;
+                    clientSeenThisFrame = true;
                     clientMisses = 0;
                     return;
                 }
 
                 clientMisses++;
                 if (HasClient && clientMisses <= framesBeforeClientRelease) return;
-
                 clientId = -1;
             }
 
@@ -219,129 +300,184 @@ namespace AR.Vision
             clientMisses = 0;
 
             float bestArea = 0f;
-            foreach (Observation o in vision.Observations)
+            foreach (Observation observation in vision.Observations)
             {
-                if (o.Kind != ObservationKind.Face) continue;
-                if (!seatZone.Contains(o.Center)) continue;
+                if (observation.Kind != ObservationKind.Face) continue;
+                if (!seatZone.Contains(observation.Center)) continue;
 
-                float area = o.NormalizedRect.width * o.NormalizedRect.height;
-                if (area > bestArea)
-                {
-                    bestArea = area;
-                    clientId = o.TrackId;
-                    Client = o;
-                    HasClient = true;
-                }
+                float area = observation.NormalizedRect.width * observation.NormalizedRect.height;
+                if (area <= bestArea) continue;
+
+                bestArea = area;
+                clientId = observation.TrackId;
+                Client = observation;
+                HasClient = true;
+                clientSeenThisFrame = true;
+            }
+
+            if (HasClient && clientId != previousClientId)
+            {
+                ResetHeadTracking();
+                ResetHaircutProgress();
             }
         }
 
         private bool TryFindFace(int trackId, out Observation face)
         {
-            foreach (Observation o in vision.Observations)
+            foreach (Observation observation in vision.Observations)
             {
-                if (o.Kind == ObservationKind.Face && o.TrackId == trackId)
+                if (observation.Kind == ObservationKind.Face && observation.TrackId == trackId)
                 {
-                    face = o;
+                    face = observation;
                     return true;
                 }
             }
+
             face = default;
             return false;
         }
 
-        private void OnAppeared(Observation o)
+        private void OnAppeared(Observation observation)
         {
-            if (o.Kind == ObservationKind.Object) tools[o.TrackId] = o;
+            if (observation.Kind == ObservationKind.Object)
+                tools[observation.TrackId] = observation;
         }
 
-        private void OnUpdated(Observation o)
+        private void OnUpdated(Observation observation)
         {
-            if (o.Kind == ObservationKind.Object)
+            if (PauseOverlay.IsPaused) return;
+
+            if (observation.Kind == ObservationKind.Object)
             {
-                tools[o.TrackId] = o;
+                tools[observation.TrackId] = observation;
                 return;
             }
 
-            if (o.Kind != ObservationKind.Hand) return;
+            if (observation.Kind != ObservationKind.Hand) return;
 
-            bool pinchNow = HandGestures.IsPinching(o);
-            pinching.TryGetValue(o.TrackId, out bool wasPinching);
-            pinching[o.TrackId] = pinchNow;
+            bool isPinching = HandGestures.IsPinching(observation);
+            pinching.TryGetValue(observation.TrackId, out bool wasPinching);
+            pinching[observation.TrackId] = isPinching;
 
-            if (!pinchNow || wasPinching) return;
-            if (!TryFindToolNear(o.Center, out Observation tool)) return;
+            // Register only the start of a pinch, not every frame while the hand is closed.
+            if (!isPinching || wasPinching) return;
+            if (!TryFindToolNear(observation.Center, out Observation tool)) return;
 
-            if (IsCuttingTool(tool))
+            LastToolName = ToolName(tool);
+            ToolPickedUp?.Invoke(LastToolName);
+
+            if (!IsCuttingTool(tool))
             {
-                if (State != CutState.SafeToCut)
-                {
-                    Guidance = "Wait until the client is still before using " + ToolName(tool);
-                    flash = Mathf.Max(flash, 0.5f);
-                    return;
-                }
-                activeCutterId = tool.TrackId;
+                Guidance = "You picked up " + LastToolName + ". Find the toy scissors for a snip!";
+                return;
             }
 
-            Debug.Log($"Barber station: picked up {ToolName(tool)}");
+            if (!HasClient || State != CutState.SafeToCut)
+            {
+                Guidance = "Let's wait until our customer is sitting still before snipping";
+                flash = Mathf.Max(flash, 0.65f);
+                return;
+            }
+
+            if (HaircutComplete) return;
+
+            SnipsCompleted = Mathf.Min(SnipsCompleted + 1, Mathf.Max(1, snipsToComplete));
+            HaircutProgressChanged?.Invoke(SnipsCompleted, Mathf.Max(1, snipsToComplete));
+
+            if (SnipsCompleted >= Mathf.Max(1, snipsToComplete))
+            {
+                HaircutComplete = true;
+                Guidance = "Amazing haircut! You did it!";
+                HaircutCompleted?.Invoke();
+            }
+            else
+            {
+                int remaining = snipsToComplete - SnipsCompleted;
+                Guidance = remaining == 1
+                    ? "One more gentle snip!"
+                    : "Snip! " + remaining + " more to finish the haircut";
+            }
         }
 
         private void OnLost(ObservationKind kind, int trackId)
         {
-            tools.Remove(trackId);
-            pinching.Remove(trackId);
-            if (trackId == activeCutterId) activeCutterId = -1;
+            if (kind == ObservationKind.Object) tools.Remove(trackId);
+            if (kind == ObservationKind.Hand) pinching.Remove(trackId);
         }
 
         private bool TryFindToolNear(Vector2 point, out Observation tool)
         {
-            float best = grabRadius;
+            float bestDistance = grabRadius;
             bool found = false;
             tool = default;
 
-            foreach (var pair in tools)
+            foreach (KeyValuePair<int, Observation> pair in tools)
             {
-                float d = Vector2.Distance(pair.Value.Center, point);
-                if (d < best)
-                {
-                    best = d;
-                    tool = pair.Value;
-                    found = true;
-                }
+                float distance = Vector2.Distance(pair.Value.Center, point);
+                if (distance >= bestDistance) continue;
+
+                bestDistance = distance;
+                tool = pair.Value;
+                found = true;
             }
+
             return found;
         }
 
         private bool IsCuttingTool(Observation tool)
         {
             string label = tool.Profile is ItemProfile item ? item.DetectorLabel : tool.Label;
-            if (string.IsNullOrEmpty(label)) return false;
+            if (string.IsNullOrWhiteSpace(label)) return false;
 
-            foreach (string c in cuttingLabels)
-                if (string.Equals(c, label, StringComparison.OrdinalIgnoreCase)) return true;
+            string normalized = NormalizeLabel(label);
+            foreach (string candidate in cuttingLabels)
+            {
+                if (string.Equals(normalized, NormalizeLabel(candidate), StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
             return false;
+        }
+
+        private static string NormalizeLabel(string value)
+        {
+            return string.IsNullOrWhiteSpace(value)
+                ? string.Empty
+                : value.Replace('_', ' ').Trim();
         }
 
         private static string ToolName(Observation tool)
         {
-            return tool.Profile != null ? tool.Profile.DisplayName : tool.Label;
+            if (tool.Profile != null)
+            {
+                string displayName = tool.Profile.DisplayName;
+                if (!string.IsNullOrWhiteSpace(displayName)) return displayName;
+            }
+            return string.IsNullOrWhiteSpace(tool.Label) ? "tool" : tool.Label;
         }
 
         private static float AngularDistance(HeadAngles a, HeadAngles b)
         {
-            float dy = b.Yaw - a.Yaw;
-            float dp = b.Pitch - a.Pitch;
-            float dr = b.Roll - a.Roll;
-            return Mathf.Sqrt(dy * dy + dp * dp + dr * dr);
+            float yaw = b.Yaw - a.Yaw;
+            float pitch = b.Pitch - a.Pitch;
+            float roll = b.Roll - a.Roll;
+            return Mathf.Sqrt(yaw * yaw + pitch * pitch + roll * roll);
         }
 
-        private void ResetClient()
+        private void ResetHeadTracking()
         {
             HasHead = false;
             stillTimer = 0f;
-            activeCutterId = -1;
             Deviation = 0f;
             InChaos = false;
-            shakeOffset = Vector2.zero;
+        }
+
+        private void ResetHaircutProgress()
+        {
+            if (SnipsCompleted == 0 && !HaircutComplete) return;
+            SnipsCompleted = 0;
+            HaircutComplete = false;
+            HaircutProgressChanged?.Invoke(0, Mathf.Max(1, snipsToComplete));
         }
 
         private void SetState(CutState next, string message)
@@ -354,171 +490,106 @@ namespace AR.Vision
             StateChanged?.Invoke(next);
         }
 
-        // ---------------------------------------------------------------------
-        // Visual output
-        // ---------------------------------------------------------------------
+        // ------------------------------ Canvas UI ------------------------------
 
-        void OnGUI()
+        private void ConfigureSliders()
         {
-            if (!showVisuals || vision == null || !vision.IsReady()) return;
-
-            EnsureStyles();
-
-            Matrix4x4 savedMatrix = GUI.matrix;
-            Color savedColor = GUI.color;
-
-            // Screen shake applies to everything drawn below.
-            GUI.matrix = Matrix4x4.Translate(shakeOffset);
-
-            if (showHat && HasClient && HasHead) DrawHat();
-            DrawVignette();
-            if (showWobbleMeter && HasHead) DrawWobbleMeter();
-            DrawBanner();
-
-            GUI.matrix = savedMatrix;
-            GUI.color = savedColor;
-        }
-
-        // A top hat that sits on the client's head. Roll tilts it, yaw narrows it as the head turns,
-        // and pitch nudges it up or down.
-        private void DrawHat()
-        {
-            Rect face = ToScreen(Client.NormalizedRect);
-            float w = face.width;
-
-            float turn = Mathf.Clamp(Mathf.Cos(SmoothedHead.Yaw * Mathf.Deg2Rad), 0.35f, 1f);
-            float brimW = w * 1.25f * turn;
-            float crownW = w * 0.7f * turn;
-            float brimH = Mathf.Max(6f, w * 0.12f);
-            float crownH = w * 0.55f;
-            float bandH = brimH * 0.8f;
-
-            Vector2 pivot = new Vector2(
-                face.center.x,
-                face.yMin - w * 0.05f + SmoothedHead.Pitch * 0.5f);
-
-            Matrix4x4 saved = GUI.matrix;
-            GUIUtility.RotateAroundPivot(SmoothedHead.Roll, pivot);
-
-            Rect brim = new Rect(pivot.x - brimW * 0.5f, pivot.y - brimH, brimW, brimH);
-            Rect crown = new Rect(pivot.x - crownW * 0.5f, brim.y - crownH, crownW, crownH);
-            Rect band = new Rect(crown.x, brim.y - bandH, crownW, bandH);
-
-            GUI.color = hatColor;
-            GUI.DrawTexture(crown, pixel);
-            GUI.DrawTexture(brim, pixel);
-
-            GUI.color = StateColor();
-            GUI.DrawTexture(band, pixel);
-
-            GUI.matrix = saved;
-        }
-
-        // Red or yellow edges that pulse when the client moves. Strength follows the flash timer and deviation.
-        private void DrawVignette()
-        {
-            float deviationPart = State == CutState.Reposition
-                ? Mathf.Clamp01((Deviation - 1f) * 0.6f)
-                : 0f;
-            float intensity = Mathf.Clamp01(flash * 0.7f + deviationPart);
-            if (intensity <= 0.01f) return;
-
-            float pulse = InChaos ? 0.8f + 0.2f * Mathf.Sin(Time.time * 14f) : 1f;
-            Color c = InChaos ? chaosColor : warnColor;
-            c.a = 0.6f * intensity * pulse;
-            GUI.color = c;
-
-            float t = 20f + 70f * intensity;
-            GUI.DrawTexture(new Rect(0, 0, Screen.width, t), pixel);
-            GUI.DrawTexture(new Rect(0, Screen.height - t, Screen.width, t), pixel);
-            GUI.DrawTexture(new Rect(0, 0, t, Screen.height), pixel);
-            GUI.DrawTexture(new Rect(Screen.width - t, 0, t, Screen.height), pixel);
-        }
-
-        // Horizontal meter. The green zone is the allowed yaw range. The needle is the client's smoothed yaw.
-        private void DrawWobbleMeter()
-        {
-            float barW = 340f;
-            float barH = 22f;
-            Rect bar = new Rect(Screen.width * 0.5f - barW * 0.5f, Screen.height - 70f, barW, barH);
-
-            GUI.color = new Color(0f, 0f, 0f, 0.6f);
-            GUI.DrawTexture(bar, pixel);
-
-            float zoneLeft = ToBar(bar, -maxYaw);
-            float zoneRight = ToBar(bar, maxYaw);
-            GUI.color = new Color(safeColor.r, safeColor.g, safeColor.b, 0.5f);
-            GUI.DrawTexture(new Rect(zoneLeft, bar.y, zoneRight - zoneLeft, barH), pixel);
-
-            float needleX = ToBar(bar, SmoothedHead.Yaw);
-            GUI.color = StateColor();
-            GUI.DrawTexture(new Rect(needleX - 3f, bar.y - 6f, 6f, barH + 12f), pixel);
-
-            string label = $"HEAD WOBBLE  yaw {SmoothedHead.Yaw:+0;-0;0} deg";
-            DrawShadowedLabel(new Rect(bar.x, bar.y - 28f, barW, 24f), label, smallStyle, Color.white);
-        }
-
-        // Maps a yaw value to an x position on the wobble meter, which spans twice the yaw limit each way.
-        private float ToBar(Rect bar, float yaw)
-        {
-            float clamped = Mathf.Clamp(yaw, -2f * maxYaw, 2f * maxYaw);
-            float t = clamped / (4f * maxYaw) + 0.5f;
-            return bar.x + t * bar.width;
-        }
-
-        // Big banner at the top with a playful line for each state, plus the guidance text below.
-        private void DrawBanner()
-        {
-            string title;
-            Color color;
-
-            switch (State)
+            if (yawSlider != null)
             {
-                case CutState.NoClient:
-                    title = "Take a seat, the chair is waiting";
-                    color = idleColor;
-                    break;
-
-                case CutState.Reposition:
-                    if (InChaos)
-                    {
-                        title = "CHAOS MODE!! Please hold still!";
-                        color = Color.HSVToRGB(Mathf.Repeat(Time.time * 0.6f, 1f), 0.85f, 1f);
-                    }
-                    else
-                    {
-                        title = "Whoa, easy there!";
-                        color = warnColor;
-                    }
-                    break;
-
-                case CutState.Settling:
-                    title = "Hold still...";
-                    color = warnColor;
-                    break;
-
-                default:
-                    title = "Looking sharp! Cut away.";
-                    color = safeColor;
-                    break;
+                yawSlider.minValue = -2f;
+                yawSlider.maxValue = 2f;
+                yawSlider.interactable = false;
             }
 
-            DrawShadowedLabel(new Rect(0, 20f, Screen.width, 60f), title, bannerStyle, color);
-            DrawShadowedLabel(new Rect(0, 84f, Screen.width, 30f), Guidance, smallStyle, Color.white);
+            if (haircutSlider != null)
+            {
+                haircutSlider.minValue = 0f;
+                haircutSlider.maxValue = Mathf.Max(1, snipsToComplete);
+                haircutSlider.interactable = false;
+            }
         }
 
-        private void DrawShadowedLabel(Rect rect, string text, GUIStyle style, Color color)
+        private void ConfigureHatPieces()
         {
-            Color saved = GUI.color;
-            GUI.color = Color.white;
+            if (hatRoot != null)
+            {
+                hatRoot.anchorMin = new Vector2(0.5f, 0.5f);
+                hatRoot.anchorMax = new Vector2(0.5f, 0.5f);
+                hatRoot.pivot = new Vector2(0.5f, 0.5f);
+                hatRoot.gameObject.SetActive(false);
+            }
 
-            style.normal.textColor = Color.black;
-            GUI.Label(new Rect(rect.x + 3f, rect.y + 3f, rect.width, rect.height), text, style);
+            ConfigureHatPiece(hatBrim, new Vector2(0f, 0f), new Vector2(1f, 0.24f), hatColor);
+            ConfigureHatPiece(hatCrown, new Vector2(0.17f, 0.22f), new Vector2(0.83f, 1f), hatColor);
+            ConfigureHatPiece(hatBand, new Vector2(0.17f, 0.23f), new Vector2(0.83f, 0.39f), safeColor);
+        }
 
-            style.normal.textColor = color;
-            GUI.Label(rect, text, style);
+        private static void ConfigureHatPiece(Image image, Vector2 anchorMin, Vector2 anchorMax, Color color)
+        {
+            if (image == null) return;
+            RectTransform rect = image.rectTransform;
+            rect.anchorMin = anchorMin;
+            rect.anchorMax = anchorMax;
+            rect.offsetMin = Vector2.zero;
+            rect.offsetMax = Vector2.zero;
+            image.color = color;
+            image.raycastTarget = false;
+        }
 
-            GUI.color = saved;
+        private void RefreshCanvasUI()
+        {
+            if (visualsRoot != null && visualsRoot.activeSelf != isActiveAndEnabled)
+                visualsRoot.SetActive(isActiveAndEnabled);
+
+            Color stateColor = StateColor();
+            if (bannerText != null)
+            {
+                bannerText.text = BannerTitle();
+                bannerText.color = State == CutState.Reposition && InChaos
+                    ? Color.HSVToRGB(Mathf.Repeat(Time.time * 0.6f, 1f), 0.85f, 1f)
+                    : stateColor;
+            }
+
+            if (guidanceText != null) guidanceText.text = Guidance;
+
+            if (wobbleText != null)
+            {
+                wobbleText.text = HasHead
+                    ? "HEAD WOBBLE   yaw " + SmoothedHead.Yaw.ToString("+0;-0;0") + "°"
+                    : "HEAD WOBBLE   waiting for face";
+                wobbleText.color = stateColor;
+            }
+
+            if (yawSlider != null)
+                yawSlider.value = HasHead ? Mathf.Clamp(SmoothedHead.Yaw / Mathf.Max(1f, maxYaw), -2f, 2f) : 0f;
+
+            if (haircutSlider != null)
+            {
+                haircutSlider.maxValue = Mathf.Max(1, snipsToComplete);
+                haircutSlider.value = SnipsCompleted;
+            }
+
+            if (haircutProgressText != null)
+            {
+                haircutProgressText.text = HaircutComplete
+                    ? "Haircut complete!"
+                    : "Haircut: " + SnipsCompleted + " / " + Mathf.Max(1, snipsToComplete) + " snips";
+            }
+
+            UpdateHat();
+            UpdateVignette();
+            UpdateEffectsShake();
+        }
+
+        private string BannerTitle()
+        {
+            switch (State)
+            {
+                case CutState.NoClient: return "The barber chair is waiting!";
+                case CutState.Reposition: return InChaos ? "Wiggle alert! Hold still!" : "Let's get comfy";
+                case CutState.Settling: return "Almost ready...";
+                default: return HaircutComplete ? "Fabulous new look!" : "Looking sharp! Ready to snip";
+            }
         }
 
         private Color StateColor()
@@ -532,44 +603,68 @@ namespace AR.Vision
             }
         }
 
-        private void EnsureStyles()
+        private void UpdateHat()
         {
-            if (bannerStyle == null)
+            if (hatRoot == null) return;
+
+            bool visible = HasClient && HasHead && overlayRoot != null && vision != null;
+            if (hatRoot.gameObject.activeSelf != visible)
+                hatRoot.gameObject.SetActive(visible);
+            if (!visible) return;
+
+            RectTransform frameRect = vision.transform as RectTransform;
+            if (frameRect == null) return;
+
+            Vector3[] corners = new Vector3[4];
+            frameRect.GetWorldCorners(corners);
+
+            // Unity corner order: bottom-left, top-left, top-right, bottom-right.
+            Rect face = Client.NormalizedRect;
+            Vector2 topLeft = NormalizedToOverlayLocal(corners, face.xMin, face.yMin);
+            Vector2 topRight = NormalizedToOverlayLocal(corners, face.xMax, face.yMin);
+            Vector2 faceTopCentre = (topLeft + topRight) * 0.5f;
+            float faceWidth = Vector2.Distance(topLeft, topRight);
+
+            hatRoot.anchoredPosition = faceTopCentre + new Vector2(0f, faceWidth * 0.12f);
+            hatRoot.sizeDelta = new Vector2(faceWidth * 1.28f, faceWidth * 0.72f);
+            hatRoot.localRotation = Quaternion.Euler(0f, 0f, -SmoothedHead.Roll);
+
+            if (hatBand != null) hatBand.color = StateColor();
+        }
+
+        private Vector2 NormalizedToOverlayLocal(Vector3[] corners, float x, float yFromTop)
+        {
+            Vector3 top = Vector3.Lerp(corners[1], corners[2], x);
+            Vector3 bottom = Vector3.Lerp(corners[0], corners[3], x);
+            Vector3 world = Vector3.Lerp(top, bottom, yFromTop);
+            return overlayRoot.InverseTransformPoint(world);
+        }
+
+        private void UpdateVignette()
+        {
+            float deviationPart = State == CutState.Reposition
+                ? Mathf.Clamp01((Deviation - 1f) * 0.6f)
+                : 0f;
+            float intensity = Mathf.Clamp01(flash * 0.7f + deviationPart);
+            float pulse = InChaos ? 0.8f + 0.2f * Mathf.Sin(Time.time * 14f) : 1f;
+            Color warningColor = InChaos ? chaosColor : warnColor;
+            warningColor.a = 0.6f * intensity * pulse;
+
+            if (vignetteEdges == null) return;
+            foreach (Image edge in vignetteEdges)
             {
-                bannerStyle = new GUIStyle(GUI.skin.label)
-                {
-                    fontSize = 44,
-                    fontStyle = FontStyle.Bold,
-                    alignment = TextAnchor.MiddleCenter
-                };
-            }
-            if (smallStyle == null)
-            {
-                smallStyle = new GUIStyle(GUI.skin.label)
-                {
-                    fontSize = 22,
-                    fontStyle = FontStyle.Bold,
-                    alignment = TextAnchor.MiddleCenter
-                };
+                if (edge == null) continue;
+                edge.color = warningColor;
+                edge.raycastTarget = false;
             }
         }
 
-        // Converts a normalized frame rect to screen pixels, using the same mapping as VisionPipeline.OnGUI.
-        private Rect ToScreen(Rect n)
+        private void UpdateEffectsShake()
         {
-            Vector3[] corners = new Vector3[4];
-            ((RectTransform)vision.transform).GetWorldCorners(corners);
-
-            float left = corners[0].x;
-            float width = corners[2].x - corners[0].x;
-            float height = corners[2].y - corners[0].y;
-            float top = Screen.height - corners[2].y;
-
-            return new Rect(
-                left + n.xMin * width,
-                top + n.yMin * height,
-                n.width * width,
-                n.height * height);
+            if (effectsRoot == null || !effectsBaseCaptured) return;
+            float amount = Mathf.Clamp01((Deviation - 1f) * 1.5f);
+            Vector2 offset = UnityEngine.Random.insideUnitCircle * (shakeMaxCanvasUnits * amount);
+            effectsRoot.anchoredPosition = effectsBasePosition + offset;
         }
     }
 }

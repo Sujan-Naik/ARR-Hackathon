@@ -71,6 +71,7 @@ namespace AR.Vision
 
 	public float FrameAspect => oriented != null ? oriented.width / (float)oriented.height : 1f;
 
+      
 
         void Awake()
         {
@@ -204,7 +205,8 @@ namespace AR.Vision
             orientMat.SetFloat("_Angle", angle);
             orientMat.SetFloat("_FlipY", flip ? 1f : 0f);
 
-            display.texture = oriented;
+
+            //display.texture = oriented;
             display.uvRect = new Rect(0f, 0f, 1f, 1f);
             display.rectTransform.localEulerAngles = Vector3.zero;
             fitter.aspectRatio = (float)w / h;
