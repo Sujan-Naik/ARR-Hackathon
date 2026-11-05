@@ -393,7 +393,7 @@ GameObject:
   m_Component:
   - component: {fileID: 812353935}
   - component: {fileID: 812353937}
-  - component: {fileID: 812353936}
+  - component: {fileID: 812353939}
   - component: {fileID: 812353938}
   m_Layer: 5
   m_Name: RawImage
@@ -421,7 +421,36 @@ RectTransform:
   m_AnchoredPosition: {x: 0, y: 0}
   m_SizeDelta: {x: -2460, y: -1340}
   m_Pivot: {x: 0.5, y: 0.5}
---- !u!114 &812353936
+--- !u!222 &812353937
+CanvasRenderer:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 812353934}
+  m_CullTransparentMesh: 1
+--- !u!114 &812353938
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 812353934}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 792e2b57308f7907ab69c100126056ed, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::FaceRecognitionPipeline
+  requestedWidth: 1920
+  requestedHeight: 1080
+  requestedFps: 30
+  faceDetectorAsset: {fileID: 5022602860645237092, guid: ff1774e31ca48866ea42dfc85ea205f5, type: 3}
+  faceEmbedderAsset: {fileID: 5022602860645237092, guid: d479f26dfeb539f8f9c76f4c365790de, type: 3}
+  detectionThreshold: 0.5
+  nmsIouThreshold: 0.45
+  matchThreshold: 0.45
+  recognizeEveryNFrames: 10
+--- !u!114 &812353939
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
@@ -448,29 +477,6 @@ MonoBehaviour:
     y: 0
     width: 1
     height: 1
---- !u!222 &812353937
-CanvasRenderer:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 812353934}
-  m_CullTransparentMesh: 1
---- !u!114 &812353938
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 812353934}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 1177abc54fd85f8f6b25bbeb79167cc5, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::WebcamFullscreenStreamer
-  requestedWidth: 1280
-  requestedHeight: 720
-  requestedFps: 10
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0
