@@ -1,4 +1,4 @@
-using UnityEngine;
+﻿using UnityEngine;
 
 namespace Stacking
 {
@@ -75,13 +75,17 @@ namespace Stacking
     /// </summary>
     public readonly struct CraneSignal
     {
+        public enum Hand { None, Left, Right }
+
         public readonly bool RaisedThisFrame;
         public readonly bool HasHand;
+        public readonly Hand RaisingHand;
 
-        public CraneSignal(bool raisedThisFrame, bool hasHand)
+        public CraneSignal(bool raisedThisFrame, bool hasHand, Hand raisingHand = Hand.None)
         {
             RaisedThisFrame = raisedThisFrame;
             HasHand = hasHand;
+            RaisingHand = raisingHand;
         }
 
         public static readonly CraneSignal None = new CraneSignal(false, false);

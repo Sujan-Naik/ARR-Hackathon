@@ -2,52 +2,42 @@ using UnityEngine;
 
 namespace Stacking
 {
-    /// <summary>
-    /// Owns the block's sweep state. First raise starts the block moving
-    /// left to right; second raise commits it. Raise while stopped ends the row.
-    /// </summary>
     public class BlockSweepController : MonoBehaviour
     {
         [SerializeField] private StackGame stackGame;
-        [Tooltip("How long the row takes to traverse the playfield at full width.")]
-        [SerializeField, Min(0.2f)] private float sweepSeconds = 2.5f;
+        [SerializeField, Min(0.05f)] private float steerRate = 0.9f;
 
-        public bool IsSweeping { get; private set; }
+        public bool  IsSweeping  { get; private set; }
+        public float SteerTarget { get; private set; }
+        public CraneSignal.Hand SteerHand { get; private set; } = CraneSignal.Hand.None;
 
-        private float pos;
+        private float pos = 0.5f;
 
         private void Awake()
         {
             if (stackGame == null) stackGame = FindObjectOfType<StackGame>();
         }
 
-        public void ToggleSweep()
-        {
-            if (stackGame == null) return;
-            if (stackGame.IsGameOver) return;
-
-            if (stackGame.IsMoving)
-            {
-                stackGame.StopBlock();
-                IsSweeping = false;
-            }
-            else
-            {
-                stackGame.SpawnBlock();
-                IsSweeping = true;
-                pos = 0f;
-            }
-        }
+        public void Steer(CraneSignal.Hand hand) { SteerHand = hand; }
 
         private void Update()
         {
-            if (!IsSweeping || stackGame == null) return;
-            if (!stackGame.IsMoving) { IsSweeping = false; return; }
+            if (stackGame == null) return;
+            IsSweeping = stackGame.IsMoving;
+            if (!IsSweeping) { SteerHand = CraneSignal.Hand.None; return; }
 
-            pos += Time.deltaTime / Mathf.Max(0.01f, sweepSeconds);
-            if (pos > 1f) pos = 0f;
-
-            stackGame.SteerMovingBlock(pos);
+            if (SteerHand == CraneSignal.Hand.Left)
+            {
+                pos = Mathf.Clamp01(pos - Time.deltaTime * steerRate);
+                SteerTarget = pos;
+                stackGame.SteerMovingBlock(pos);
+            }
+            else if (SteerHand == CraneSignal.Hand.Right)
+            {
+                pos = Mathf.Clamp01(pos + Time.deltaTime * steerRate);
+                SteerTarget = pos;
+                stackGame.SteerMovingBlock(pos);
+            }
         }
     }
 }

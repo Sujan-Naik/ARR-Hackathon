@@ -1,0 +1,1085 @@
+================================================================
+FILE: Assets/Scripts/Stacking/StackGame.cs
+================================================================
+*** MISSING ***
+
+================================================================
+FILE: Assets/Scripts/Stacking/StackingDirector.cs
+================================================================
+﻿using System;
+using UnityEngine;
+
+namespace Stacking
+{
+    /// <summary>
+    /// Owns the stacking-game flow. Two behavioural modes:
+    ///
+    ///   GUIDED   - the barber's hands are near the child's head. The tower
+    ///              follows the child's head. No panic.
+    ///   HOLDING  - the barber's hands are away. The tower holds its last lean.
+    ///              The child must mirror the held lean. Mismatch -> panic.
+    ///
+    /// The parent's raise toggles the block's left-to-right sweep.
+    /// </summary>
+    public class StackingDirector : MonoBehaviour
+    {
+        public enum Phase
+        {
+            WaitingForChild,
+            WaitingForBarber,
+            WaitingForParent,
+            Playing,
+            GameOver,
+        }
+
+        [Header("Inputs")]
+        [SerializeField] private ChildHeadInput childHead;
+        [SerializeField] private BarberHandsInput monsterHands;
+        [SerializeField] private ParentHandsInput craneHands;
+
+        [Header("Gameplay")]
+        [SerializeField] private StackGame stackGame;
+        [SerializeField] private BlockSweepController sweep;
+        [SerializeField] private TiltMatchView matchView;
+
+        [Header("Guiding detection")]
+        [Tooltip("Barber hand closer than this (normalized screen distance) to the child's head means guiding.")]
+        [SerializeField, Range(0.02f, 0.5f)] private float guideEnterDistance = 0.12f;
+        [Tooltip("Barber hand must be farther than this to exit guiding (hysteresis).")]
+        [SerializeField, Range(0.02f, 0.6f)] private float guideExitDistance = 0.18f;
+
+        [Header("Tilt")]
+        [SerializeField, Min(0.1f)] private float tiltLerpSpeed = 6f;
+
+        [Header("Match")]
+        [Tooltip("Tolerance between the child's head roll and the tower's held lean.")]
+        [SerializeField, Range(1f, 30f)] private float matchToleranceDegrees = 8f;
+
+        public Phase CurrentPhase { get; private set; } = Phase.WaitingForChild;
+        public HeadTiltSignal Head { get; private set; } = HeadTiltSignal.None;
+        public MonsterHandsSignal Monster { get; private set; } = MonsterHandsSignal.None;
+        public CraneSignal Crane { get; private set; } = CraneSignal.None;
+
+        public bool BarberGuiding { get; private set; }
+        public float HeldTilt { get; private set; }
+        public float CurrentTilt { get; private set; }
+        public TiltMatch Match { get; private set; } = TiltMatch.Unknown;
+        public float MatchError01 { get; private set; }
+
+        public bool ParentPresent => Crane.HasHand;
+        public CraneSignal.Hand ParentRaisingHand => Crane.RaisingHand;
+
+        public event Action<Phase> PhaseChanged;
+
+        private void Awake()
+        {
+            if (stackGame == null) stackGame = FindObjectOfType<StackGame>();
+            if (sweep == null) sweep = FindObjectOfType<BlockSweepController>();
+        }
+
+        private void OnEnable()
+        {
+            if (childHead != null) childHead.Changed += OnHead;
+            if (monsterHands != null) monsterHands.Changed += OnMonster;
+            if (craneHands != null) craneHands.Changed += OnCrane;
+        }
+
+        private void OnDisable()
+        {
+            if (childHead != null) childHead.Changed -= OnHead;
+            if (monsterHands != null) monsterHands.Changed -= OnMonster;
+            if (craneHands != null) craneHands.Changed -= OnCrane;
+        }
+
+        private void Update()
+        {
+            if (PauseOverlay.IsPaused) return;
+
+            UpdateGuidingState();
+            UpdateTiltAndMatch();
+            ApplyTiltToTower();
+
+            if (matchView != null)
+                matchView.Apply(Match, MatchError01);
+
+            UpdatePhase();
+        }
+
+        private void UpdateGuidingState()
+        {
+            if (!Head.HasFace || !Monster.HasAny)
+            {
+                BarberGuiding = false;
+                return;
+            }
+
+            float nearest = float.MaxValue;
+            if (Monster.Left.IsBound)
+                nearest = Mathf.Min(nearest, Vector2.Distance(Monster.Left.Center, Head.Center));
+            if (Monster.Right.IsBound)
+                nearest = Mathf.Min(nearest, Vector2.Distance(Monster.Right.Center, Head.Center));
+
+            // Hysteresis: enter at guideEnterDistance, exit at guideExitDistance.
+            float threshold = BarberGuiding ? guideExitDistance : guideEnterDistance;
+            BarberGuiding = nearest <= threshold;
+        }
+
+        private void UpdateTiltAndMatch()
+        {
+            if (BarberGuiding)
+            {
+                // Guided: tower follows the child's head.
+                HeldTilt = Head.HasFace ? Head.RollDegrees : 0f;
+                Match = TiltMatch.Unknown;
+                MatchError01 = 0f;
+            }
+            else
+            {
+                // Holding: tower keeps HeldTilt; child must mirror it.
+                if (!Head.HasFace)
+                {
+                    Match = TiltMatch.Unknown;
+                    MatchError01 = 0f;
+                }
+                else
+                {
+                    float error = Mathf.Abs(Head.RollDegrees - HeldTilt);
+                    MatchError01 = Mathf.Clamp01(error / Mathf.Max(1f, matchToleranceDegrees));
+                    Match = error <= matchToleranceDegrees ? TiltMatch.Matched : TiltMatch.Mismatched;
+                }
+            }
+
+            CurrentTilt = Mathf.Lerp(CurrentTilt, HeldTilt, Time.deltaTime * tiltLerpSpeed);
+        }
+
+        private void ApplyTiltToTower()
+        {
+            if (stackGame == null || stackGame.TowerRoot == null) return;
+            stackGame.TowerRoot.localRotation = Quaternion.Euler(0f, 0f, CurrentTilt);
+        }
+
+        private void UpdatePhase()
+        {
+            Phase next;
+            if (stackGame == null) next = Phase.WaitingForChild;
+            else if (stackGame.IsGameOver) next = Phase.GameOver;
+            else if (!Head.HasFace) next = Phase.WaitingForChild;
+            else if (!Monster.HasAny) next = Phase.WaitingForBarber;
+            else if (!Crane.HasHand) next = Phase.WaitingForParent;
+            else next = Phase.Playing;
+
+            if (next == CurrentPhase) return;
+            CurrentPhase = next;
+            PhaseChanged?.Invoke(next);
+        }
+
+        private void OnHead(HeadTiltSignal s) => Head = s;
+        private void OnMonster(MonsterHandsSignal s) => Monster = s;
+
+        private void OnCrane(CraneSignal signal)
+        {
+            Crane = signal;
+            if (stackGame == null || stackGame.IsGameOver) return;
+
+            if (signal.HasHand && signal.RaisedThisFrame)
+                sweep?.ToggleSweep(signal.RaisingHand);
+
+            // Continuous steer while a hand is raised (or clear it when not).
+            sweep?.Steer(signal.HasHand ? signal.RaisingHand : CraneSignal.Hand.None);
+        }
+    }
+}
+
+================================================================
+FILE: Assets/Scripts/Stacking/BlockSweepController.cs
+================================================================
+using UnityEngine;
+
+namespace Stacking
+{
+    /// <summary>
+    /// Owns the block's sweep state. First parent raise starts the block moving;
+    /// while a parent hand is raised, Steer biases the target left/right. When
+    /// no hand is raised, StackGame's own auto ping-pong continues.
+    /// </summary>
+    public class BlockSweepController : MonoBehaviour
+    {
+        [SerializeField] private StackGame stackGame;
+        [Tooltip("How long the row takes to traverse the playfield at full width.")]
+        [SerializeField, Min(0.2f)] private float sweepSeconds = 2.5f;
+        [Tooltip("How fast a raised parent hand biases the steering target.")]
+        [SerializeField, Min(0.05f)] private float steerRate = 0.9f;
+
+        public bool IsSweeping { get; private set; }
+        public float SteerTarget { get; private set; }
+        public CraneSignal.Hand SteerHand { get; private set; } = CraneSignal.Hand.None;
+
+        private float pos;
+
+        private void Awake()
+        {
+            if (stackGame == null) stackGame = FindObjectOfType<StackGame>();
+        }
+
+        public void ToggleSweep(CraneSignal.Hand hand)
+        {
+            if (stackGame == null) return;
+            if (stackGame.IsGameOver) return;
+            if (stackGame.IsMoving) return; // first raise only starts it
+
+            stackGame.SpawnBlock();
+            IsSweeping = true;
+            pos = hand == CraneSignal.Hand.Left ? 1f : 0f;
+            SteerTarget = pos;
+        }
+
+        public void Steer(CraneSignal.Hand hand)
+        {
+            SteerHand = hand;
+        }
+
+        private void Update()
+        {
+            if (stackGame == null) return;
+            if (!IsSweeping) return;
+            if (!stackGame.IsMoving) { IsSweeping = false; SteerHand = CraneSignal.Hand.None; return; }
+
+            if (SteerHand == CraneSignal.Hand.Left)
+            {
+                pos = Mathf.Clamp01(pos - Time.deltaTime * steerRate);
+                SteerTarget = pos;
+                stackGame.SteerMovingBlock(pos);
+            }
+            else if (SteerHand == CraneSignal.Hand.Right)
+            {
+                pos = Mathf.Clamp01(pos + Time.deltaTime * steerRate);
+                SteerTarget = pos;
+                stackGame.SteerMovingBlock(pos);
+            }
+            // No hand: leave StackGame's internal sweep alone.
+        }
+    }
+}
+
+================================================================
+FILE: Assets/Scripts/Stacking/ChildHandsInput.cs
+================================================================
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+using AR.Vision;
+
+namespace Stacking
+{
+    public class ChildHandsInput : MonoBehaviour
+    {
+        [SerializeField] private ParticipantHandAssociation association;
+        [SerializeField, Min(0f)] private float closeCooldown = 0.3f;
+        [SerializeField, Min(0f)] private float minCloseHold = 0.05f;
+
+        public bool PlacedThisFrame { get; private set; }
+        public bool HasHand { get; private set; }
+        public event Action Placed;
+
+        private readonly List<Observation> scratch = new List<Observation>();
+        private readonly Dictionary<int, bool> prevClosed = new Dictionary<int, bool>();
+        private readonly Dictionary<int, float> closeStart = new Dictionary<int, float>();
+        private float lastPlaceTime = -100f;
+
+        private void Awake()
+        {
+            if (association == null) association = FindObjectOfType<ParticipantHandAssociation>();
+        }
+
+        private void Update()
+        {
+            PlacedThisFrame = false;
+            if (association == null || !association.RolesAssigned)
+            { HasHand = false; prevClosed.Clear(); closeStart.Clear(); return; }
+
+            association.GetHandsForRole(ParticipantHandAssociation.ParticipantRole.Child, scratch);
+            HasHand = scratch.Count > 0;
+            if (!HasHand) { prevClosed.Clear(); closeStart.Clear(); return; }
+
+            bool canFire = Time.time - lastPlaceTime >= closeCooldown;
+
+            for (int i = 0; i < scratch.Count; i++)
+            {
+                Observation h = scratch[i];
+                int id = h.TrackId;
+                bool closed = HandGestures.IsClosed(h);
+                prevClosed.TryGetValue(id, out bool wasClosed);
+                prevClosed[id] = closed;
+
+                if (closed && !wasClosed) closeStart[id] = Time.time;
+                else if (!closed) closeStart.Remove(id);
+
+                if (!closed || !canFire) continue;
+                if (!closeStart.TryGetValue(id, out float start)) continue;
+                if (Time.time - start < minCloseHold) continue;
+
+                lastPlaceTime = Time.time;
+                PlacedThisFrame = true;
+                Placed?.Invoke();
+                return;
+            }
+        }
+    }
+}
+
+================================================================
+FILE: Assets/Scripts/Stacking/Signals.cs
+================================================================
+﻿using UnityEngine;
+
+namespace Stacking
+{
+    /// <summary>
+    /// The child's head angles, in absolute degrees. When the barber is guiding,
+    /// this directly drives the tower lean. When the barber is not guiding, this
+    /// is compared against the tower's held lean to decide "matched / mismatched".
+    /// </summary>
+    public readonly struct HeadTiltSignal
+    {
+        public readonly float RollDegrees;
+        public readonly float YawDegrees;
+        public readonly Vector2 Center;
+        public readonly bool HasFace;
+        public readonly int TrackId;
+
+        public HeadTiltSignal(float rollDegrees, float yawDegrees, Vector2 center, bool hasFace, int trackId)
+        {
+            RollDegrees = rollDegrees;
+            YawDegrees = yawDegrees;
+            Center = center;
+            HasFace = hasFace;
+            TrackId = trackId;
+        }
+
+        public static readonly HeadTiltSignal None =
+            new HeadTiltSignal(0f, 0f, Vector2.zero, false, -1);
+    }
+
+    /// <summary>One monster hand in normalized screen space.</summary>
+    public readonly struct MonsterHand
+    {
+        public readonly int TrackId;
+        public readonly Vector2 Center;
+        public readonly bool IsOpen;
+        public readonly bool IsClosed;
+        public readonly bool IsPinching;
+        public readonly bool IsBound;
+
+        public MonsterHand(int trackId, Vector2 center, bool isOpen, bool isClosed, bool isPinching)
+        {
+            TrackId = trackId;
+            Center = center;
+            IsOpen = isOpen;
+            IsClosed = isClosed;
+            IsPinching = isPinching;
+            IsBound = trackId > 0;
+        }
+
+        public static readonly MonsterHand Unbound =
+            new MonsterHand(-1, Vector2.zero, false, false, false);
+    }
+
+    /// <summary>The barber's two hands. Either one may be unbound.</summary>
+    public readonly struct MonsterHandsSignal
+    {
+        public readonly MonsterHand Left;
+        public readonly MonsterHand Right;
+        public readonly bool HasAny;
+
+        public MonsterHandsSignal(MonsterHand left, MonsterHand right, bool hasAny)
+        {
+            Left = left;
+            Right = right;
+            HasAny = hasAny;
+        }
+
+        public static readonly MonsterHandsSignal None =
+            new MonsterHandsSignal(MonsterHand.Unbound, MonsterHand.Unbound, false);
+    }
+
+    /// <summary>
+    /// Parent input. A raise is an edge-triggered toggle of the block's sweep.
+    /// </summary>
+    public readonly struct CraneSignal
+    {
+        public enum Hand { None, Left, Right }
+
+        public readonly bool RaisedThisFrame;
+        public readonly bool HasHand;
+        public readonly Hand RaisingHand;
+
+        public CraneSignal(bool raisedThisFrame, bool hasHand, Hand raisingHand = Hand.None)
+        {
+            RaisedThisFrame = raisedThisFrame;
+            HasHand = hasHand;
+            RaisingHand = raisingHand;
+        }
+
+        public static readonly CraneSignal None = new CraneSignal(false, false);
+    }
+
+    /// <summary>How well the child's head matches the tower's held lean.</summary>
+    public enum TiltMatch
+    {
+        /// <summary>Cannot evaluate: barber guiding, or child/monster not tracked.</summary>
+        Unknown,
+        /// <summary>Child is mirroring the tower's lean within tolerance.</summary>
+        Matched,
+        /// <summary>Child is not mirroring the tower's lean.</summary>
+        Mismatched,
+    }
+}
+
+================================================================
+FILE: Assets/Scripts/Stacking/ParentHandsInput.cs
+================================================================
+*** MISSING ***
+
+================================================================
+FILE: Assets/Scripts/Stacking/ChildHeadInput.cs
+================================================================
+*** MISSING ***
+
+================================================================
+FILE: Assets/Scripts/AR/Vision/Stub/VisionStub.cs
+================================================================
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace AR.Vision
+{
+    public class VisionStub : VisionPipeline
+    {
+        [SerializeField] private bool  autoAdvance = true;
+        [SerializeField, Min(0.5f)] private float stepSeconds = 3.0f;
+        [SerializeField] private bool  parentEnabled = true;
+
+        [SerializeField] private Vector2 childFaceCentre   = new Vector2(0.30f, 0.30f);
+        [SerializeField] private Vector2 barberFaceCentre  = new Vector2(0.70f, 0.30f);
+        [SerializeField] private Vector2 parentFaceCentre  = new Vector2(0.50f, 0.80f);
+        [SerializeField] private float   faceSize          = 0.16f;
+        [SerializeField] private float   handOffsetBelow   = 0.14f;
+        [SerializeField] private float   headRollSwing     = 12f;
+        [SerializeField] private float   barberNearOffset  = 0.04f;
+        [SerializeField] private float   barberFarOffset   = 0.40f;
+        [SerializeField] private float   parentRaiseHeight = 0.14f;
+
+        protected override bool WantsWebcam => false;
+
+        public override bool  IsReady() => true;
+        public override float FrameAspect => 16f / 9f;
+        public override IReadOnlyList<Observation> Observations => currentList;
+
+        private readonly List<Observation> currentList = new List<Observation>();
+        private readonly HashSet<int> lastIds = new HashSet<int>();
+        private float stepTimer, t;
+
+        private const int ChildFaceId = 1, BarberFaceId = 2, ParentFaceId = 3;
+        private const int BarberLHandId = 10, BarberRHandId = 11, ChildHandId = 12;
+        private const int ParentLHandId = 20, ParentRHandId = 21;
+
+        private enum Step { Warmup, FacesOnly, ChildClosesSpawn, ParentLeft, ParentRight, BarberNear, BarberAway, ChildClosesCommit }
+        private static readonly string[] StepNames =
+        {
+            "1/8 warmup",
+            "2/8 faces appear",
+            "3/8 child closes hand (spawn already automatic; close commits if block live)",
+            "4/8 parent own-LEFT raise -> steer left",
+            "5/8 parent own-RIGHT raise -> steer right",
+            "6/8 barber hands NEAR -> GUIDED",
+            "7/8 barber hands AWAY -> HOLDING",
+            "8/8 child closes hand -> commit + respawn",
+        };
+        public string Caption { get; private set; } = "";
+        public int StepIndex { get; private set; }
+        public string StepName { get; private set; } = StepNames[0];
+
+        private void Awake() { Caption = "[Space] advance, [P] parent."; }
+
+        private void Update()
+        {
+            t += Time.deltaTime;
+            if (Input.GetKeyDown(KeyCode.Space)) Advance();
+            if (Input.GetKeyDown(KeyCode.P)) parentEnabled = !parentEnabled;
+            if (autoAdvance) { stepTimer += Time.deltaTime; if (stepTimer >= stepSeconds) Advance(); }
+            Rebuild();
+        }
+
+        private void Advance()
+        {
+            stepTimer = 0f;
+            StepIndex = (StepIndex + 1) % StepNames.Length;
+            StepName = StepNames[StepIndex];
+        }
+
+        private void Rebuild()
+        {
+            currentList.Clear();
+            Step step = (Step)StepIndex;
+
+            if (step >= Step.FacesOnly)
+            {
+                AddFace(ChildFaceId, childFaceCentre, RollNow());
+                AddFace(BarberFaceId, barberFaceCentre, 0f);
+                AddFace(ParentFaceId, parentFaceCentre, 0f);
+            }
+
+            if (step >= Step.ChildClosesSpawn)
+            {
+                bool closed = (step == Step.ChildClosesSpawn || step == Step.ChildClosesCommit) && stepTimer > 1.0f;
+                AddHand(ChildHandId, childFaceCentre + new Vector2(0f, handOffsetBelow), closed);
+            }
+
+            if (step == Step.BarberNear || step == Step.BarberAway)
+            {
+                float off = step == Step.BarberNear ? barberNearOffset : barberFarOffset;
+                AddHand(BarberLHandId, childFaceCentre + new Vector2(-off, 0f), false);
+                AddHand(BarberRHandId, childFaceCentre + new Vector2( off, 0f), false);
+                Caption = step == Step.BarberNear ? "Barber NEAR -> GUIDED" : "Barber AWAY -> HOLDING";
+            }
+            else Caption = "Barber idle";
+
+            if (step == Step.ParentLeft && parentEnabled)
+            {
+                Vector2 home = new Vector2(0.65f, 0.85f), up = home - new Vector2(0f, parentRaiseHeight);
+                bool raised = stepTimer > 1.0f;
+                AddHand(ParentLHandId, raised ? up : home, false);
+                Caption = "Parent LEFT " + (raised ? "RAISED -> steer left" : "rest");
+            }
+            else if (step == Step.ParentRight && parentEnabled)
+            {
+                Vector2 home = new Vector2(0.35f, 0.85f), up = home - new Vector2(0f, parentRaiseHeight);
+                bool raised = stepTimer > 1.0f;
+                AddHand(ParentRHandId, raised ? up : home, false);
+                Caption = "Parent RIGHT " + (raised ? "RAISED -> steer right" : "rest");
+            }
+            else if ((step == Step.ParentLeft || step == Step.ParentRight) && !parentEnabled)
+                Caption = "Parent disabled";
+
+            HashSet<int> nowIds = new HashSet<int>();
+            foreach (var o in currentList) nowIds.Add(o.TrackId);
+            foreach (var o in currentList)
+            {
+                if (lastIds.Contains(o.TrackId)) RaiseUpdated(o); else RaiseAppeared(o);
+            }
+            foreach (var id in lastIds)
+                if (!nowIds.Contains(id))
+                    RaiseLost(id >= 10 ? ObservationKind.Hand : ObservationKind.Face, id);
+            lastIds.Clear();
+            foreach (var id in nowIds) lastIds.Add(id);
+        }
+
+        private float RollNow()
+        {
+            Step s = (Step)StepIndex;
+            if (s < Step.BarberNear) return 0f;
+            if (s == Step.BarberNear) return Mathf.Sin(t * 1.2f) * headRollSwing;
+            return Mathf.Sin(t * 1.2f) * headRollSwing * 1.6f;
+        }
+
+        private void AddFace(int id, Vector2 c, float rollDeg)
+        {
+            float half = faceSize * 0.5f, r = rollDeg * Mathf.Deg2Rad;
+            Vector2 le = c + Rot(new Vector2(-half * 0.4f, -half * 0.15f), r);
+            Vector2 re = c + Rot(new Vector2( half * 0.4f, -half * 0.15f), r);
+            Vector2 no = c + Rot(new Vector2( 0f, 0f), r);
+            Vector2 ml = c + Rot(new Vector2(-half * 0.3f,  half * 0.35f), r);
+            Vector2 mr = c + Rot(new Vector2( half * 0.3f,  half * 0.35f), r);
+            var rect = Rect.MinMaxRect(c.x - half, c.y - half, c.x + half, c.y + half);
+            currentList.Add(new Observation(id, ObservationKind.Face, "unknown", null,
+                0.9f, 0f, rect, new[] { le, re, no, ml, mr }, 1, false));
+        }
+
+        private void AddHand(int id, Vector2 c, bool closed)
+        {
+            var rect = Rect.MinMaxRect(c.x - 0.06f, c.y - 0.06f, c.x + 0.06f, c.y + 0.06f);
+            currentList.Add(new Observation(id, ObservationKind.Hand, "Left", null,
+                0.9f, 0f, rect, BuildHandJoints(c, closed), 1, true));
+        }
+
+        private static Vector2[] BuildHandJoints(Vector2 wrist, bool closed)
+        {
+            var kp = new Vector2[21];
+            kp[0] = wrist;
+            // mcp, pip, dip, tip for 4 fingers + thumb
+            // open: tip ~0.06 above wrist. closed: tip ~0.005 above wrist.
+            float mid = closed ? 0.012f : 0.028f;
+            float tip = closed ? 0.006f : 0.060f;
+            F(kp,  1, 2, 3, 4, wrist, -0.030f, 0.0f, mid, tip, -0.010f);
+            F(kp,  5, 6, 7, 8, wrist, -0.020f, 0.0f, mid, tip, -0.020f);
+            F(kp,  9,10,11,12, wrist, -0.005f, 0.0f, mid, tip,  0.000f);
+            F(kp, 13,14,15,16, wrist,  0.008f, 0.0f, mid, tip,  0.010f);
+            F(kp, 17,18,19,20, wrist,  0.020f, 0.0f, mid, tip,  0.020f);
+            return kp;
+        }
+
+        private static void F(Vector2[] kp, int a, int b, int c, int d,
+                             Vector2 w, float xoff, float yoff, float mid, float tip, float drift)
+        {
+            Vector2 p0 = w + new Vector2(xoff, yoff);
+            Vector2 p1 = p0 + new Vector2(drift * 0.3f, -mid);
+            Vector2 p2 = p1 + new Vector2(drift * 0.3f, -mid * 0.6f);
+            Vector2 p3 = p2 + new Vector2(drift * 0.4f, -tip * 0.6f);
+            kp[a] = p0; kp[b] = p1; kp[c] = p2; kp[d] = p3;
+        }
+
+        private static Vector2 Rot(Vector2 v, float r)
+        {
+            float cs = Mathf.Cos(r), sn = Mathf.Sin(r);
+            return new Vector2(v.x * cs - v.y * sn, v.x * sn + v.y * cs);
+        }
+
+        private void OnGUI() { DrawBoxes(); DrawHud(); }
+
+        private void DrawBoxes()
+        {
+            var prev = GUI.color;
+            foreach (var o in currentList)
+            {
+                Color c = o.Kind == ObservationKind.Face
+                    ? (o.TrackId == ChildFaceId ? new Color(0.3f, 0.8f, 1f, 0.9f) : new Color(0.9f, 0.9f, 0.9f, 0.6f))
+                    : (o.TrackId == ParentLHandId || o.TrackId == ParentRHandId
+                        ? new Color(1f, 0.6f, 0.2f, 0.9f) : new Color(0.2f, 1f, 0.5f, 0.9f));
+                var r = new Rect(o.NormalizedRect.x * Screen.width, o.NormalizedRect.y * Screen.height,
+                                 o.NormalizedRect.width * Screen.width, o.NormalizedRect.height * Screen.height);
+                GUI.color = c; Outline(r, 2f);
+                if (o.Keypoints != null && o.Keypoints.Length >= 21)
+                    for (int i = 0; i < 21; i++)
+                    {
+                        var kp = o.Keypoints[i];
+                        GUI.DrawTexture(new Rect(kp.x * Screen.width - 1.5f, kp.y * Screen.height - 1.5f, 3f, 3f), Texture2D.whiteTexture);
+                    }
+            }
+            GUI.color = prev;
+        }
+
+        private static void Outline(Rect r, float th)
+        {
+            GUI.DrawTexture(new Rect(r.xMin, r.yMin, r.width, th), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(r.xMin, r.yMax - th, r.width, th), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(r.xMin, r.yMin, th, r.height), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(r.xMax - th, r.yMin, th, r.height), Texture2D.whiteTexture);
+        }
+
+        private void DrawHud()
+        {
+            const float w = 760f, h = 250f, pad = 12f;
+            var panel = new Rect(pad, Screen.height - h - pad, w, h);
+            var prev = GUI.color;
+            GUI.color = new Color(0f, 0f, 0f, 0.72f);
+            GUI.DrawTexture(panel, Texture2D.whiteTexture);
+            GUI.color = prev;
+
+            float y = panel.y + 6, x = panel.x + 10;
+            var director = FindObjectOfType<Stacking.StackingDirector>();
+            var sweep = FindObjectOfType<Stacking.BlockSweepController>();
+            var childIn = FindObjectOfType<Stacking.ChildHandsInput>();
+            var game = FindObjectOfType<StackGame>();
+
+            L(ref y, x, w, "VISION STUB - " + StepName, true, Color.white);
+            L(ref y, x, w, "Caption: " + Caption, false, new Color(0.85f, 0.9f, 1f));
+            L(ref y, x, w, "[Space] advance  [P] parent=" + (parentEnabled ? "ON" : "OFF") + "  auto=" + autoAdvance, false, Color.white);
+            L(ref y, x, w, "obs=" + currentList.Count, false, Color.white);
+            if (director != null)
+            {
+                L(ref y, x, w, "GUIDED=" + director.BarberGuiding + "  HeldTilt=" + director.HeldTilt.ToString("0.0") +
+                    "  CurrentTilt=" + director.CurrentTilt.ToString("0.0") + "  Match=" + director.Match, false, Color.white);
+                L(ref y, x, w, "ParentRaisingHand=" + director.ParentRaisingHand, false, new Color(1f, 0.8f, 0.5f));
+            }
+            if (childIn != null)
+                L(ref y, x, w, "ChildHasHand=" + childIn.HasHand + "  PlacedThisFrame=" + childIn.PlacedThisFrame, false, new Color(0.6f, 1f, 0.9f));
+            if (sweep != null)
+                L(ref y, x, w, "SteerTarget=" + sweep.SteerTarget.ToString("0.00") + "  SteerHand=" + sweep.SteerHand, false, new Color(0.8f, 1f, 0.7f));
+            if (game != null)
+                L(ref y, x, w, "Moving=" + game.IsMoving + "  Score=" + game.Score + "  GameOver=" + game.IsGameOver, false, Color.white);
+        }
+
+        private static void L(ref float y, float x, float w, string s, bool bold, Color c)
+        {
+            if (_style == null) _style = new GUIStyle(GUI.skin.label) { fontSize = 12 };
+            _style.fontStyle = bold ? FontStyle.Bold : FontStyle.Normal;
+            _style.normal.textColor = c;
+            GUI.Label(new Rect(x, y, w, 18), s, _style);
+            y += 18;
+        }
+        private static GUIStyle _style;
+    }
+}
+
+================================================================
+FILE: Assets/Scripts/AR/Vision/VisionPipeline.cs
+================================================================
+// Role: game-facing facade. Owns the webcam, orientation, the single frame readback,
+// module slots, per-kind trackers and the public events. Game code never sees tensors.
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+
+namespace AR.Vision
+{
+    [RequireComponent(typeof(RawImage))]
+    public class VisionPipeline : MonoBehaviour
+    {
+        [Header("Webcam")]
+        [SerializeField] private int requestedWidth = 1920;
+        [SerializeField] private int requestedHeight = 1080;
+        [SerializeField] private int requestedFps = 30;
+
+        [Header("Models")]
+        [SerializeField] private ModelSettings models = new ModelSettings();
+
+        [Header("Modules")]
+        [SerializeField] private bool enableFaces = true;
+        [SerializeField] private bool enableHands = false;
+        [SerializeField] private bool enableObjects = false;
+
+        [Header("Tracking")]
+        [SerializeField] private float trackIouThreshold = 0.3f;
+        [SerializeField] private int maxMissedFrames = 5;
+
+        [Header("Profiles")]
+        [SerializeField] private TrackableRegistry registry;
+
+        [Header("Debug")]
+        [SerializeField] private bool drawOverlay = true;
+
+        private const int FrameSize = ScrfdDetector.DetSize;
+
+        public event Action<Observation> ObservationAppeared;
+        public event Action<Observation> ObservationUpdated;
+        public event Action<ObservationKind, int> ObservationLost;
+        public event Action<Observation, TrackableProfile> IdentityChanged;
+
+        protected void RaiseAppeared(Observation o) => ObservationAppeared?.Invoke(o);
+        protected void RaiseUpdated(Observation o)  => ObservationUpdated?.Invoke(o);
+        protected void RaiseLost(ObservationKind k, int id) => ObservationLost?.Invoke(k, id);
+        protected void RaiseIdentity(Observation o, TrackableProfile p) => IdentityChanged?.Invoke(o, p);
+
+        public virtual IReadOnlyList<Observation> Observations => current;
+
+        private sealed class Slot
+        {
+            public VisionModule Module;
+            public ObservationTracker Tracker;
+        }
+
+        private readonly List<Slot> slots = new List<Slot>();
+        private readonly List<Observation> current = new List<Observation>();
+        private readonly VisionFrame frame = new VisionFrame();
+        private ObservationTracker faceTracker;
+        private FaceModule faceModule;
+        private ProfileResolver resolver;
+
+        private WebCamTexture webcam;
+        private RawImage display;
+        private AspectRatioFitter fitter;
+        private Material orientMat;
+        private RenderTexture oriented;
+        private RenderTexture detInput;
+        private Texture2D detReadback;
+        private Coroutine startRoutine;
+        private int frameCount;
+
+        protected virtual bool WantsWebcam => true;
+
+        public virtual float FrameAspect => oriented != null ? oriented.width / (float)oriented.height : 1f;
+
+        void Awake()
+        {
+            display = GetComponent<RawImage>();
+
+            RectTransform rt = (RectTransform)transform;
+            rt.anchorMin = Vector2.zero;
+            rt.anchorMax = Vector2.one;
+            rt.offsetMin = Vector2.zero;
+            rt.offsetMax = Vector2.zero;
+
+            fitter = GetComponent<AspectRatioFitter>();
+            if (fitter == null) fitter = gameObject.AddComponent<AspectRatioFitter>();
+            fitter.aspectMode = AspectRatioFitter.AspectMode.EnvelopeParent;
+
+            Shader shader = Shader.Find("Hidden/OrientCorrect");
+            if (shader == null) Debug.LogError("Hidden/OrientCorrect shader not found in project.");
+            orientMat = new Material(shader);
+
+            detInput = new RenderTexture(FrameSize, FrameSize, 0, RenderTextureFormat.ARGB32);
+            detReadback = new Texture2D(FrameSize, FrameSize, TextureFormat.RGB24, false);
+
+            resolver = ResolveProfile;
+            BuildModules();
+        }
+
+        protected virtual void OnEnable()
+        {
+            if (WantsWebcam) startRoutine = StartCoroutine(StartWebcam());
+        }
+
+        protected virtual void OnDisable()
+        {
+            if (startRoutine != null)
+            {
+                StopCoroutine(startRoutine);
+                startRoutine = null;
+            }
+            if (webcam != null && webcam.isPlaying) webcam.Stop();
+        }
+
+        protected virtual void OnDestroy()
+        {
+            if (webcam != null)
+            {
+                webcam.Stop();
+                Destroy(webcam);
+                webcam = null;
+            }
+            for (int i = 0; i < slots.Count; i++) slots[i].Module.Dispose();
+            slots.Clear();
+
+            if (oriented != null) oriented.Release();
+            if (detInput != null) detInput.Release();
+            if (detReadback != null) Destroy(detReadback);
+        }
+
+        void BuildModules()
+        {
+            if (enableFaces)
+            {
+                faceModule = new FaceModule(models.face);
+                faceTracker = AddSlot(faceModule);
+            }
+            if (enableHands) AddSlot(new HandModule(models.hand));
+            if (enableObjects) AddSlot(new ObjectModule(models.objects));
+        }
+
+        ObservationTracker AddSlot(VisionModule module)
+        {
+            var tracker = new ObservationTracker(module.Kind, trackIouThreshold, maxMissedFrames);
+            slots.Add(new Slot { Module = module, Tracker = tracker });
+            return tracker;
+        }
+
+        public virtual bool IsReady()
+        {
+            return webcam != null && webcam.isPlaying && oriented != null && detReadback != null;
+        }
+
+        IEnumerator StartWebcam()
+        {
+            if (!Application.HasUserAuthorization(UserAuthorization.WebCam))
+                yield return Application.RequestUserAuthorization(UserAuthorization.WebCam);
+
+            if (!Application.HasUserAuthorization(UserAuthorization.WebCam))
+            {
+                Debug.LogError("Webcam permission denied.");
+                yield break;
+            }
+
+            if (WebCamTexture.devices.Length == 0)
+            {
+                Debug.LogError("No webcam devices found.");
+                yield break;
+            }
+
+            if (webcam == null)
+            {
+                webcam = new WebCamTexture(WebCamTexture.devices[0].name, requestedWidth, requestedHeight, requestedFps);
+            }
+
+            webcam.Play();
+
+            float timeout = 5f;
+            while (webcam.width <= 16 && timeout > 0f)
+            {
+                timeout -= Time.deltaTime;
+                yield return null;
+            }
+
+            SetupOrientation();
+            startRoutine = null;
+        }
+
+        void SetupOrientation()
+        {
+            int angle = webcam.videoRotationAngle;
+            bool flip = webcam.videoVerticallyMirrored;
+            bool swap = angle == 90 || angle == 270;
+
+            int w = swap ? webcam.height : webcam.width;
+            int h = swap ? webcam.width : webcam.height;
+
+            if (oriented == null || oriented.width != w || oriented.height != h)
+            {
+                if (oriented != null) oriented.Release();
+                oriented = new RenderTexture(w, h, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+            }
+
+            orientMat.SetFloat("_Angle", angle);
+            orientMat.SetFloat("_FlipY", flip ? 1f : 0f);
+
+            display.uvRect = new Rect(0f, 0f, 1f, 1f);
+            display.rectTransform.localEulerAngles = Vector3.zero;
+            fitter.aspectRatio = (float)w / h;
+        }
+
+        protected virtual void Update()
+        {
+            if (!WantsWebcam) return;
+
+            current.Clear();
+            if (!IsReady() || !webcam.didUpdateThisFrame) return;
+
+            Graphics.Blit(webcam, oriented, orientMat);
+            Graphics.Blit(oriented, detInput);
+            RefreshReadback();
+
+            frame.CopyFrom(detReadback);
+            frameCount++;
+
+            for (int s = 0; s < slots.Count; s++)
+            {
+                Slot slot = slots[s];
+                if (!slot.Module.IsReady) continue;
+
+                List<Detection> detections = slot.Module.Detect(frame);
+                bool recognitionDue = slot.Module.RecognitionDue(frameCount);
+
+                slot.Tracker.Update(
+                    detections,
+                    resolver,
+                    recognitionDue,
+                    tracks => slot.Module.Recognize(frame, tracks));
+
+                PublishEvents(slot.Tracker);
+            }
+        }
+
+        void RefreshReadback()
+        {
+            RenderTexture previous = RenderTexture.active;
+            RenderTexture.active = detInput;
+            detReadback.ReadPixels(new Rect(0, 0, FrameSize, FrameSize), 0, 0);
+            detReadback.Apply();
+            RenderTexture.active = previous;
+        }
+
+        private UnityEngine.Object ResolveProfile(ObservationKind kind, string label, bool identified)
+        {
+            if (registry == null || !identified || string.IsNullOrEmpty(label)) return null;
+
+            switch (kind)
+            {
+                case ObservationKind.Face:
+                    return registry.FindCharacterByName(label);
+                case ObservationKind.Object:
+                    return registry.FindItemByDetectorLabel(label);
+                default:
+                    return null;
+            }
+        }
+
+        private void PublishEvents(ObservationTracker tracker)
+        {
+            IReadOnlyList<TrackedObservation> lost = tracker.Lost;
+            for (int i = 0; i < lost.Count; i++)
+                ObservationLost?.Invoke(tracker.Kind, lost[i].TrackId);
+
+            IReadOnlyList<TrackedObservation> appeared = tracker.Appeared;
+            for (int i = 0; i < appeared.Count; i++)
+                ObservationAppeared?.Invoke(ToPublic(appeared[i]));
+
+            IReadOnlyList<TrackedObservation> active = tracker.Active;
+            for (int i = 0; i < active.Count; i++)
+            {
+                TrackedObservation tr = active[i];
+                Observation obs = ToPublic(tr);
+                current.Add(obs);
+
+                if (tr.IdentityChangedThisFrame)
+                    IdentityChanged?.Invoke(obs, obs.Profile);
+
+                ObservationUpdated?.Invoke(obs);
+            }
+        }
+
+        private static Observation ToPublic(TrackedObservation t)
+        {
+            return new Observation(
+                t.TrackId,
+                t.Kind,
+                t.Label,
+                t.ProfileObject as TrackableProfile,
+                t.Confidence,
+                t.MatchScore,
+                t.NormalizedRect,
+                t.Keypoints,
+                t.FramesTracked,
+                t.Identified);
+        }
+
+        public void EnrollLargestFace(string personName)
+        {
+            if (faceModule == null || !faceModule.IsReady || faceTracker == null)
+            {
+                Debug.LogWarning("Face module is not ready.");
+                return;
+            }
+
+            IReadOnlyList<TrackedObservation> faces = faceTracker.Active;
+            if (faces.Count == 0)
+            {
+                Debug.LogWarning("No face in view to enroll.");
+                return;
+            }
+
+            TrackedObservation largest = faces[0];
+            for (int i = 1; i < faces.Count; i++)
+            {
+                Rect a = faces[i].NormalizedRect;
+                Rect b = largest.NormalizedRect;
+                if (a.width * a.height > b.width * b.height) largest = faces[i];
+            }
+
+            faceModule.Enroll(personName, frame, largest);
+        }
+
+        void OnGUI()
+        {
+            if (!drawOverlay || display == null || oriented == null || current.Count == 0) return;
+
+            Vector3[] corners = new Vector3[4];
+            ((RectTransform)transform).GetWorldCorners(corners);
+
+            float left = corners[0].x;
+            float width = corners[2].x - corners[0].x;
+            float height = corners[2].y - corners[0].y;
+            float top = Screen.height - corners[2].y;
+
+            for (int i = 0; i < current.Count; i++)
+            {
+                Observation o = current[i];
+                Rect n = o.NormalizedRect;
+                Rect r = new Rect(
+                    left + n.xMin * width,
+                    top + n.yMin * height,
+                    n.width * width,
+                    n.height * height);
+
+                GUI.Box(r, $"{o.Label ?? o.Kind.ToString()} {o.Confidence:0.00}");
+            }
+        }
+    }
+}
+
+================================================================
+FILE: Assets/Scripts/ParticipantHandAssociation.cs
+================================================================
+*** MISSING ***
+

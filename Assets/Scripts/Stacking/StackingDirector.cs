@@ -1,33 +1,17 @@
-using System;
+﻿using System;
 using UnityEngine;
 
 namespace Stacking
 {
-    /// <summary>
-    /// Owns the stacking-game flow. Two behavioural modes:
-    ///
-    ///   GUIDED   - the barber's hands are near the child's head. The tower
-    ///              follows the child's head. No panic.
-    ///   HOLDING  - the barber's hands are away. The tower holds its last lean.
-    ///              The child must mirror the held lean. Mismatch -> panic.
-    ///
-    /// The parent's raise toggles the block's left-to-right sweep.
-    /// </summary>
     public class StackingDirector : MonoBehaviour
     {
-        public enum Phase
-        {
-            WaitingForChild,
-            WaitingForBarber,
-            WaitingForParent,
-            Playing,
-            GameOver,
-        }
+        public enum Phase { WaitingForChild, WaitingForBarber, WaitingForParent, Playing, GameOver }
 
         [Header("Inputs")]
         [SerializeField] private ChildHeadInput childHead;
         [SerializeField] private BarberHandsInput monsterHands;
         [SerializeField] private ParentHandsInput craneHands;
+        [SerializeField] private ChildHandsInput childHands;
 
         [Header("Gameplay")]
         [SerializeField] private StackGame stackGame;
@@ -35,16 +19,13 @@ namespace Stacking
         [SerializeField] private TiltMatchView matchView;
 
         [Header("Guiding detection")]
-        [Tooltip("Barber hand closer than this (normalized screen distance) to the child's head means guiding.")]
         [SerializeField, Range(0.02f, 0.5f)] private float guideEnterDistance = 0.12f;
-        [Tooltip("Barber hand must be farther than this to exit guiding (hysteresis).")]
         [SerializeField, Range(0.02f, 0.6f)] private float guideExitDistance = 0.18f;
 
         [Header("Tilt")]
         [SerializeField, Min(0.1f)] private float tiltLerpSpeed = 6f;
 
         [Header("Match")]
-        [Tooltip("Tolerance between the child's head roll and the tower's held lean.")]
         [SerializeField, Range(1f, 30f)] private float matchToleranceDegrees = 8f;
 
         public Phase CurrentPhase { get; private set; } = Phase.WaitingForChild;
@@ -58,12 +39,18 @@ namespace Stacking
         public TiltMatch Match { get; private set; } = TiltMatch.Unknown;
         public float MatchError01 { get; private set; }
 
+        public bool ParentPresent => Crane.HasHand;
+        public CraneSignal.Hand ParentRaisingHand => Crane.RaisingHand;
+
         public event Action<Phase> PhaseChanged;
+
+        private bool _firstSpawnDone;
 
         private void Awake()
         {
             if (stackGame == null) stackGame = FindObjectOfType<StackGame>();
             if (sweep == null) sweep = FindObjectOfType<BlockSweepController>();
+            if (childHands == null) childHands = FindObjectOfType<ChildHandsInput>();
         }
 
         private void OnEnable()
@@ -71,6 +58,7 @@ namespace Stacking
             if (childHead != null) childHead.Changed += OnHead;
             if (monsterHands != null) monsterHands.Changed += OnMonster;
             if (craneHands != null) craneHands.Changed += OnCrane;
+            if (childHands != null) childHands.Placed += OnChildPlaced;
         }
 
         private void OnDisable()
@@ -78,37 +66,37 @@ namespace Stacking
             if (childHead != null) childHead.Changed -= OnHead;
             if (monsterHands != null) monsterHands.Changed -= OnMonster;
             if (craneHands != null) craneHands.Changed -= OnCrane;
+            if (childHands != null) childHands.Placed -= OnChildPlaced;
         }
 
         private void Update()
         {
             if (PauseOverlay.IsPaused) return;
 
+            EnsureFirstBlockSpawned();
             UpdateGuidingState();
             UpdateTiltAndMatch();
             ApplyTiltToTower();
 
-            if (matchView != null)
-                matchView.Apply(Match, MatchError01);
-
+            if (matchView != null) matchView.Apply(Match, MatchError01);
             UpdatePhase();
+        }
+
+        private void EnsureFirstBlockSpawned()
+        {
+            if (stackGame == null || stackGame.IsGameOver) return;
+            if (!stackGame.IsMoving)
+                stackGame.SpawnBlock();
         }
 
         private void UpdateGuidingState()
         {
-            if (!Head.HasFace || !Monster.HasAny)
-            {
-                BarberGuiding = false;
-                return;
-            }
+            if (!Head.HasFace || !Monster.HasAny) { BarberGuiding = false; return; }
 
             float nearest = float.MaxValue;
-            if (Monster.Left.IsBound)
-                nearest = Mathf.Min(nearest, Vector2.Distance(Monster.Left.Center, Head.Center));
-            if (Monster.Right.IsBound)
-                nearest = Mathf.Min(nearest, Vector2.Distance(Monster.Right.Center, Head.Center));
+            if (Monster.Left.IsBound)  nearest = Mathf.Min(nearest, Vector2.Distance(Monster.Left.Center, Head.Center));
+            if (Monster.Right.IsBound) nearest = Mathf.Min(nearest, Vector2.Distance(Monster.Right.Center, Head.Center));
 
-            // Hysteresis: enter at guideEnterDistance, exit at guideExitDistance.
             float threshold = BarberGuiding ? guideExitDistance : guideEnterDistance;
             BarberGuiding = nearest <= threshold;
         }
@@ -117,19 +105,13 @@ namespace Stacking
         {
             if (BarberGuiding)
             {
-                // Guided: tower follows the child's head.
                 HeldTilt = Head.HasFace ? Head.RollDegrees : 0f;
                 Match = TiltMatch.Unknown;
                 MatchError01 = 0f;
             }
             else
             {
-                // Holding: tower keeps HeldTilt; child must mirror it.
-                if (!Head.HasFace)
-                {
-                    Match = TiltMatch.Unknown;
-                    MatchError01 = 0f;
-                }
+                if (!Head.HasFace) { Match = TiltMatch.Unknown; MatchError01 = 0f; }
                 else
                 {
                     float error = Mathf.Abs(Head.RollDegrees - HeldTilt);
@@ -137,7 +119,6 @@ namespace Stacking
                     Match = error <= matchToleranceDegrees ? TiltMatch.Matched : TiltMatch.Mismatched;
                 }
             }
-
             CurrentTilt = Mathf.Lerp(CurrentTilt, HeldTilt, Time.deltaTime * tiltLerpSpeed);
         }
 
@@ -168,9 +149,17 @@ namespace Stacking
         private void OnCrane(CraneSignal signal)
         {
             Crane = signal;
-            if (!signal.HasHand || !signal.RaisedThisFrame) return;
             if (stackGame == null || stackGame.IsGameOver) return;
-            sweep?.ToggleSweep();
+            sweep?.Steer(signal.HasHand ? signal.RaisingHand : CraneSignal.Hand.None);
+        }
+
+        private void OnChildPlaced()
+        {
+            if (stackGame == null || stackGame.IsGameOver) return;
+            if (stackGame.IsMoving)
+                stackGame.StopBlock();
+            if (!stackGame.IsMoving)
+                stackGame.SpawnBlock();
         }
     }
 }

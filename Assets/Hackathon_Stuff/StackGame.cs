@@ -1,26 +1,9 @@
 using System;
-using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.UI;
 
-/// <summary>
-/// Block stacking game. Blocks are generated at runtime.
-///
-/// Two rendering modes:
-///   • 3D mode  - blocks are world-space cubes. Uses a hijacked orthographic
-///                Camera.main side view (legacy behaviour, kept for the
-///                desktop-only demo scene).
-///   • Canvas mode - blocks are UI Images parented to canvasTowerRoot, mapped
-///                from cell units to pixels. This is the mode used when the
-///                game is played "over the webcam": the tower lives in the
-///                same RectTransform space as the vision preview, so the
-///                child's head, the monster's hands and the tower all share
-///                one coordinate system.
-///
-/// The game LOGIC (rows, overlap, scoring, steering) always works in integer
-/// cell units. Only the renderer knows about world space or pixels.
-/// </summary>
+/// <summary>3D-only block stacking game. Cubes with real gravity.</summary>
 public class StackGame : MonoBehaviour
 {
     [Header("Grid")]
@@ -41,26 +24,13 @@ public class StackGame : MonoBehaviour
     [Header("Slow mode")]
     [SerializeField, Range(0.1f, 1f)] public float slowMultiplier = 0.4f;
 
-    [Header("Camera (3D mode only)")]
+    [Header("Camera")]
     [SerializeField] public Camera cam;
     [SerializeField, Min(0f)] public float cameraFollowSpeed = 3f;
 
     [Header("Vision steering")]
-    [Tooltip("When true, the moving row ignores its automatic sweep and is steered directly by SteerMovingBlock.")]
     [SerializeField] private bool steerByExternalInput = false;
-    [Tooltip("How quickly the moving row eases toward the externally steered column.")]
     [SerializeField, Min(0.1f)] private float steerLerpSpeed = 12f;
-
-    [Header("Canvas rendering")]
-    [Tooltip("Assign a RectTransform anchored to the webcam preview to render the " +
-             "tower as UI Images. Leave empty for legacy 3D cubes.")]
-    [SerializeField] private RectTransform canvasTowerRoot;
-    [Tooltip("Optional sprite template for a block. A 1x1 white square is used if empty.")]
-    [SerializeField] private Image canvasBlockPrefab;
-    [Tooltip("Pixel gap between adjacent blocks.")]
-    [SerializeField, Min(0f)] private float cellGapPixels = 2f;
-    [Tooltip("Bottom padding, in cell units, between the canvas bottom and row 0.")]
-    [SerializeField, Min(0f)] private float canvasBottomPaddingCells = 0.5f;
 
     [Header("Canvas UI")]
     [SerializeField] private Text scoreText;
@@ -77,13 +47,11 @@ public class StackGame : MonoBehaviour
     public bool IsGameOver => gameOver;
     public bool IsMoving => movingRow != null;
     public Transform TowerRoot => towerRoot;
-    public RectTransform CanvasTowerRoot => canvasTowerRoot;
-    public bool UsesCanvasRendering => canvasTowerRoot != null;
 
     public event Action<int> ScoreChanged;
     public event Action<int> GameOver;
 
-    private Transform towerRoot;              // parent of rows (either world or Canvas)
+    private Transform towerRoot;
     private Transform movingRow;
     private int rowIndex;
     private int prevStart;
@@ -97,7 +65,6 @@ public class StackGame : MonoBehaviour
     private bool initialized;
     private bool buttonsBound;
 
-    // External steering state.
     private bool hasSteerTarget;
     private float steerTargetPos;
 
@@ -119,30 +86,14 @@ public class StackGame : MonoBehaviour
         if (initialized) ConfigureCameraForGame();
     }
 
-    private void Start()
-    {
-        RestartGame();
-    }
-
-    private void OnDisable()
-    {
-        RestoreCameraDefaults();
-    }
-
-    private void OnDestroy()
-    {
-        UnbindButtons();
-    }
+    private void Start() { RestartGame(); }
+    private void OnDisable() { RestoreCameraDefaults(); }
+    private void OnDestroy() { UnbindButtons(); }
 
     private void Update()
     {
         if (PauseOverlay.IsPaused || !initialized) return;
-
-        if (gameOver)
-        {
-            RefreshCanvasUI();
-            return;
-        }
+        if (gameOver) { RefreshCanvasUI(); return; }
 
         if (Input.GetKeyDown(slowKey)) ToggleSlow();
 
@@ -156,14 +107,10 @@ public class StackGame : MonoBehaviour
             float max = columns - width;
 
             if (steerByExternalInput && hasSteerTarget)
-            {
-                pos = Mathf.Lerp(pos, Mathf.Clamp(steerTargetPos, 0f, max),
-                                 Time.deltaTime * steerLerpSpeed);
-            }
+                pos = Mathf.Lerp(pos, Mathf.Clamp(steerTargetPos, 0f, max), Time.deltaTime * steerLerpSpeed);
             else
             {
                 pos += dir * currentSpeed * Time.deltaTime;
-
                 if (pos > max) { pos = max; dir = -1f; }
                 else if (pos < 0f) { pos = 0f; dir = 1f; }
             }
@@ -172,30 +119,16 @@ public class StackGame : MonoBehaviour
             if (Input.GetKeyDown(stopKey) || MousePressedOutsideUI(0)) StopBlock();
         }
 
-        if (!UsesCanvasRendering) FollowTowerWithCamera();
+        FollowTowerWithCamera();
         RefreshCanvasUI();
     }
 
-    /// <summary>Starts a fresh round. Safe to call from a Canvas Button or game-flow script.</summary>
     public void RestartGame()
     {
         EnsureInitialized();
 
-        if (towerRoot != null)
-            Destroy(towerRoot.gameObject);
-
-        towerRoot = new GameObject(UsesCanvasRendering ? "Canvas Stack Tower" : "Stack Tower").transform;
-
-        if (UsesCanvasRendering)
-        {
-            RectTransform rt = towerRoot.gameObject.AddComponent<RectTransform>();
-            rt.SetParent(canvasTowerRoot, false);
-            rt.anchorMin = Vector2.zero;
-            rt.anchorMax = Vector2.zero;
-            rt.pivot = Vector2.zero;
-            rt.anchoredPosition = new Vector2(0f, canvasBottomPaddingCells * CellPixels);
-            rt.sizeDelta = Vector2.zero;
-        }
+        if (towerRoot != null) Destroy(towerRoot.gameObject);
+        towerRoot = new GameObject("Stack Tower").transform;
 
         movingRow = null;
         rowIndex = 1;
@@ -210,8 +143,7 @@ public class StackGame : MonoBehaviour
         hasSteerTarget = false;
 
         BuildRow(prevWidth, 0, prevStart);
-
-        if (!UsesCanvasRendering) ConfigureCameraForGame();
+        ConfigureCameraForGame();
 
         if (gameOverPanel != null) gameOverPanel.SetActive(false);
         ScoreChanged?.Invoke(Score);
@@ -220,8 +152,8 @@ public class StackGame : MonoBehaviour
 
     public void SpawnBlock()
     {
-        if (PauseOverlay.IsPaused || !initialized || gameOver || movingRow != null) return;
-
+        EnsureInitialized();
+        if (PauseOverlay.IsPaused || gameOver || movingRow != null) return;
         pos = 0f;
         dir = 1f;
         hasSteerTarget = false;
@@ -230,29 +162,18 @@ public class StackGame : MonoBehaviour
         RefreshCanvasUI();
     }
 
-    /// <summary>
-    /// Steers the currently moving row to a normalized X in [0, 1] across the
-    /// playfield width. Only effective while a row is moving. When
-    /// steerByExternalInput is false this enables it for the rest of the round.
-    /// </summary>
     public void SteerMovingBlock(float normalizedX)
     {
         if (movingRow == null || gameOver) return;
-
         steerByExternalInput = true;
         float max = columns - width;
         steerTargetPos = Mathf.Clamp01(normalizedX) * max;
         hasSteerTarget = true;
     }
 
-    /// <summary>
-    /// Discrete variant: advances the steering target one cell right (dir=+1) or
-    /// left (dir=-1). Useful for "raise hand to step" inputs. Clamped to playfield.
-    /// </summary>
     public void NudgeMovingBlock(int direction)
     {
         if (movingRow == null || gameOver) return;
-
         steerByExternalInput = true;
         float max = columns - width;
         float basePos = hasSteerTarget ? steerTargetPos : pos;
@@ -274,32 +195,9 @@ public class StackGame : MonoBehaviour
         RefreshCanvasUI();
     }
 
-    // ------------------------------------------------------------------
-    // Rendering: cell units -> world or pixels
-    // ------------------------------------------------------------------
-
-    private float CellPixels
-    {
-        get
-        {
-            if (canvasTowerRoot == null) return 1f;
-            float w = canvasTowerRoot.rect.width;
-            return w > 0.001f ? w / Mathf.Max(1, columns) : 1f;
-        }
-    }
-
     private void SetRowCellPosition(Transform row, float cellX, int cellY)
     {
-        if (UsesCanvasRendering)
-        {
-            RectTransform rt = row as RectTransform;
-            if (rt != null)
-                rt.anchoredPosition = new Vector2(cellX * CellPixels, cellY * CellPixels);
-        }
-        else
-        {
-            row.position = new Vector3(cellX, cellY, 0f);
-        }
+        row.position = new Vector3(cellX, cellY, 0f);
     }
 
     private Transform BuildRow(int cells, int y, int startCell)
@@ -307,70 +205,21 @@ public class StackGame : MonoBehaviour
         Transform row = new GameObject("Row " + y).transform;
         Color color = Color.HSVToRGB((y * 0.07f) % 1f, 0.6f, 0.95f);
 
-        if (UsesCanvasRendering)
-        {
-            RectTransform rowRect = row.gameObject.AddComponent<RectTransform>();
-            rowRect.SetParent(towerRoot, false);
-            rowRect.anchorMin = Vector2.zero;
-            rowRect.anchorMax = Vector2.zero;
-            rowRect.pivot = Vector2.zero;
-            rowRect.sizeDelta = new Vector2(cells * CellPixels, CellPixels);
-            rowRect.anchoredPosition = new Vector2(startCell * CellPixels, y * CellPixels);
+        row.SetParent(towerRoot, false);
+        row.position = new Vector3(startCell, y, 0f);
 
-            for (int i = 0; i < cells; i++)
-            {
-                Image block = SpawnCanvasBlock(rowRect, color);
-                RectTransform blockRect = block.rectTransform;
-                blockRect.anchorMin = Vector2.zero;
-                blockRect.anchorMax = Vector2.zero;
-                blockRect.pivot = Vector2.zero;
-                blockRect.sizeDelta = new Vector2(
-                    Mathf.Max(1f, CellPixels - cellGapPixels),
-                    Mathf.Max(1f, CellPixels - cellGapPixels));
-                blockRect.anchoredPosition = new Vector2(i * CellPixels, 0f);
-            }
-        }
-        else
+        for (int i = 0; i < cells; i++)
         {
-            row.SetParent(towerRoot, false);
-            row.position = new Vector3(startCell, y, 0f);
-
-            for (int i = 0; i < cells; i++)
-            {
-                GameObject cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
-                cube.transform.SetParent(row, false);
-                cube.transform.localPosition = new Vector3(i, 0f, 0f);
-                cube.GetComponent<Renderer>().material.color = color;
-                Collider cubeCollider = cube.GetComponent<Collider>();
-                if (cubeCollider != null) Destroy(cubeCollider);
-            }
+            GameObject cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            cube.transform.SetParent(row, false);
+            cube.transform.localPosition = new Vector3(i, 0f, 0f);
+            cube.GetComponent<Renderer>().material.color = color;
+            Collider cc = cube.GetComponent<Collider>();
+            if (cc != null) Destroy(cc);
         }
 
         return row;
     }
-
-    private Image SpawnCanvasBlock(RectTransform parent, Color color)
-    {
-        Image img;
-        if (canvasBlockPrefab != null)
-        {
-            img = Instantiate(canvasBlockPrefab, parent);
-        }
-        else
-        {
-            GameObject go = new GameObject("Block", typeof(RectTransform), typeof(Image));
-            img = go.GetComponent<Image>();
-            go.transform.SetParent(parent, false);
-        }
-
-        img.color = color;
-        img.raycastTarget = false;
-        return img;
-    }
-
-    // ------------------------------------------------------------------
-    // Lifecycle
-    // ------------------------------------------------------------------
 
     private void EnsureInitialized()
     {
@@ -392,13 +241,37 @@ public class StackGame : MonoBehaviour
 
     private void ConfigureCameraForGame()
     {
-        // Canvas mode leaves the camera alone: the tower is on the Canvas.
-        if (UsesCanvasRendering || cam == null) return;
-
+        if (cam == null) return;
         cam.orthographic = true;
-        cam.orthographicSize = Mathf.Max(7f, columns * 0.6f / Mathf.Max(0.1f, cam.aspect));
+        ApplyFraming(instant: true);
         cam.transform.rotation = Quaternion.identity;
-        cam.transform.position = new Vector3((columns - 1) / 2f, 5f, -10f);
+    }
+
+    private void ApplyFraming(bool instant)
+    {
+        if (cam == null) return;
+        float aspect = Mathf.Max(0.1f, cam.aspect);
+        float halfWidth = columns * 0.5f;
+        float sizeForWidth = halfWidth / aspect;
+        float topRow = Mathf.Max(1f, rowIndex);
+        float verticalSpan = topRow + 2f;
+        float sizeForHeight = verticalSpan * 0.5f;
+        float targetSize = Mathf.Max(sizeForWidth, sizeForHeight);
+        float targetX = (columns - 1) * 0.5f;
+        float targetY = (topRow - 1f) * 0.5f;
+        Vector3 targetPos = new Vector3(targetX, Mathf.Max(0f, targetY), -10f);
+
+        if (instant)
+        {
+            cam.orthographicSize = targetSize;
+            cam.transform.position = targetPos;
+        }
+        else
+        {
+            float k = Time.deltaTime * cameraFollowSpeed;
+            cam.orthographicSize = Mathf.Lerp(cam.orthographicSize, targetSize, k);
+            cam.transform.position = Vector3.Lerp(cam.transform.position, targetPos, k);
+        }
     }
 
     private void RestoreCameraDefaults()
@@ -409,14 +282,7 @@ public class StackGame : MonoBehaviour
         cam.transform.SetPositionAndRotation(cameraStartPosition, cameraStartRotation);
     }
 
-    private void FollowTowerWithCamera()
-    {
-        if (cam == null) return;
-        Vector3 cameraPosition = cam.transform.position;
-        float targetY = Mathf.Max(5f, rowIndex - 2f);
-        cameraPosition.y = Mathf.Lerp(cameraPosition.y, targetY, Time.deltaTime * cameraFollowSpeed);
-        cam.transform.position = cameraPosition;
-    }
+    private void FollowTowerWithCamera() => ApplyFraming(instant: false);
 
     private void PlaceMovingRow()
     {
@@ -429,9 +295,7 @@ public class StackGame : MonoBehaviour
 
         if (overlap <= 0)
         {
-            for (int i = movingRow.childCount - 1; i >= 0; i--)
-                Drop(movingRow.GetChild(i));
-
+            for (int i = movingRow.childCount - 1; i >= 0; i--) Drop(movingRow.GetChild(i));
             Destroy(movingRow.gameObject);
             movingRow = null;
             FinishGame();
@@ -441,8 +305,7 @@ public class StackGame : MonoBehaviour
         for (int i = movingRow.childCount - 1; i >= 0; i--)
         {
             int cell = snap + i;
-            if (cell < overlapStart || cell >= overlapEnd)
-                Drop(movingRow.GetChild(i));
+            if (cell < overlapStart || cell >= overlapEnd) Drop(movingRow.GetChild(i));
         }
 
         prevStart = overlapStart;
@@ -452,40 +315,15 @@ public class StackGame : MonoBehaviour
         speed = Mathf.Min(speed + speedIncrease, maxSpeed);
         movingRow = null;
         hasSteerTarget = false;
-
         ScoreChanged?.Invoke(Score);
     }
 
     private void Drop(Transform block)
     {
-        // Canvas blocks have no physics: just fade them out with a quick tween.
-        if (UsesCanvasRendering)
-        {
-            Image img = block.GetComponent<Image>();
-            if (img != null) StartCoroutine(FadeAndDestroy(img));
-            else Destroy(block.gameObject);
-            return;
-        }
-
         block.SetParent(null, true);
         Rigidbody body = block.gameObject.AddComponent<Rigidbody>();
         body.AddTorque(UnityEngine.Random.insideUnitSphere * 2f, ForceMode.Impulse);
         Destroy(block.gameObject, 3f);
-    }
-
-    private System.Collections.IEnumerator FadeAndDestroy(Image img)
-    {
-        img.transform.SetParent(transform, true);
-        float t = 0f;
-        Color start = img.color;
-        while (t < 0.35f && img != null)
-        {
-            t += Time.deltaTime;
-            float a = 1f - Mathf.Clamp01(t / 0.35f);
-            img.color = new Color(start.r, start.g, start.b, a);
-            yield return null;
-        }
-        if (img != null) Destroy(img.gameObject);
     }
 
     private void FinishGame()
@@ -497,37 +335,20 @@ public class StackGame : MonoBehaviour
         RefreshCanvasUI();
     }
 
-    private bool PointerIsOverUI()
-    {
-        return EventSystem.current != null && EventSystem.current.IsPointerOverGameObject();
-    }
+    private bool PointerIsOverUI() => EventSystem.current != null && EventSystem.current.IsPointerOverGameObject();
 
     private bool MousePressedOutsideUI(int button)
     {
         return allowMouseOutsideUI && Input.GetMouseButtonDown(button) && !PointerIsOverUI();
     }
 
-    // ------------------------------------------------------------------
-    // UI hooks
-    // ------------------------------------------------------------------
-
-    /// <summary>
-    /// Allows KidsSalonGameFlow (or another runtime UI builder) to supply the
-    /// Canvas controls without requiring any Inspector assignments.
-    /// </summary>
     public void ConfigureRuntimeCanvasUI(
-        Text runtimeScoreText,
-        Text runtimeInstructionText,
-        Text runtimeSlowModeText,
-        Text runtimeGameOverText,
-        GameObject runtimeGameOverPanel,
-        Button runtimeSpawnButton,
-        Button runtimeStopButton,
-        Button runtimeSlowButton,
-        Button runtimeRestartButton)
+        Text runtimeScoreText, Text runtimeInstructionText, Text runtimeSlowModeText,
+        Text runtimeGameOverText, GameObject runtimeGameOverPanel,
+        Button runtimeSpawnButton, Button runtimeStopButton,
+        Button runtimeSlowButton, Button runtimeRestartButton)
     {
         UnbindButtons();
-
         scoreText = runtimeScoreText;
         instructionText = runtimeInstructionText;
         slowModeText = runtimeSlowModeText;
@@ -537,19 +358,8 @@ public class StackGame : MonoBehaviour
         stopButton = runtimeStopButton;
         slowButton = runtimeSlowButton;
         restartButton = runtimeRestartButton;
-
         BindButtons();
         RefreshCanvasUI();
-    }
-
-    /// <summary>
-    /// Assigns the RectTransform that tower blocks will render into. Pass null
-    /// to fall back to 3D cube rendering on the next RestartGame.
-    /// </summary>
-    public void ConfigureCanvasTowerRoot(RectTransform root)
-    {
-        canvasTowerRoot = root;
-        if (initialized) RestartGame();
     }
 
     private void BindButtons()
@@ -580,8 +390,8 @@ public class StackGame : MonoBehaviour
         if (instructionText != null)
         {
             if (gameOver) instructionText.text = "Round over! Try again or return to the salon.";
-            else if (movingRow == null) instructionText.text = "Parent: raise a hand to send the next block";
-            else instructionText.text = "Parent: raise a hand to steer \u2022 Child: close a hand to stop";
+            else if (movingRow == null) instructionText.text = "Raise a hand to send the next block";
+            else instructionText.text = "Parent: raise to steer \u2022 Child: raise to place";
         }
 
         if (gameOverText != null) gameOverText.text = "Tower score: " + Score + "\nGreat stacking!";

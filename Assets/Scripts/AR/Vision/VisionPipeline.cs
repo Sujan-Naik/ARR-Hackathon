@@ -34,7 +34,6 @@ namespace AR.Vision
         [Header("Debug")]
         [SerializeField] private bool drawOverlay = true;
 
-        // Frame size used by every module: SCRFD runs on the full 640x640 frame.
         private const int FrameSize = ScrfdDetector.DetSize;
 
         public event Action<Observation> ObservationAppeared;
@@ -42,8 +41,12 @@ namespace AR.Vision
         public event Action<ObservationKind, int> ObservationLost;
         public event Action<Observation, TrackableProfile> IdentityChanged;
 
-        // Observations from the most recent completed frame.
-        public IReadOnlyList<Observation> Observations => current;
+        protected void RaiseAppeared(Observation o) => ObservationAppeared?.Invoke(o);
+        protected void RaiseUpdated(Observation o)  => ObservationUpdated?.Invoke(o);
+        protected void RaiseLost(ObservationKind k, int id) => ObservationLost?.Invoke(k, id);
+        protected void RaiseIdentity(Observation o, TrackableProfile p) => IdentityChanged?.Invoke(o, p);
+
+        public virtual IReadOnlyList<Observation> Observations => current;
 
         private sealed class Slot
         {
@@ -62,16 +65,15 @@ namespace AR.Vision
         private RawImage display;
         private AspectRatioFitter fitter;
         private Material orientMat;
-        private RenderTexture oriented;     // upright, unmirrored full frame
-        private RenderTexture detInput;     // 640x640 copy of the frame for the modules
-        private Texture2D detReadback;      // CPU copy of detInput (bottom-up, Unity convention)
+        private RenderTexture oriented;
+        private RenderTexture detInput;
+        private Texture2D detReadback;
         private Coroutine startRoutine;
         private int frameCount;
 
+        protected virtual bool WantsWebcam => true;
 
-	public float FrameAspect => oriented != null ? oriented.width / (float)oriented.height : 1f;
-
-      
+        public virtual float FrameAspect => oriented != null ? oriented.width / (float)oriented.height : 1f;
 
         void Awake()
         {
@@ -98,12 +100,12 @@ namespace AR.Vision
             BuildModules();
         }
 
-        void OnEnable()
+        protected virtual void OnEnable()
         {
-            startRoutine = StartCoroutine(StartWebcam());
+            if (WantsWebcam) startRoutine = StartCoroutine(StartWebcam());
         }
 
-        void OnDisable()
+        protected virtual void OnDisable()
         {
             if (startRoutine != null)
             {
@@ -113,7 +115,7 @@ namespace AR.Vision
             if (webcam != null && webcam.isPlaying) webcam.Stop();
         }
 
-        void OnDestroy()
+        protected virtual void OnDestroy()
         {
             if (webcam != null)
             {
@@ -147,7 +149,7 @@ namespace AR.Vision
             return tracker;
         }
 
-        public bool IsReady()
+        public virtual bool IsReady()
         {
             return webcam != null && webcam.isPlaying && oriented != null && detReadback != null;
         }
@@ -205,24 +207,22 @@ namespace AR.Vision
             orientMat.SetFloat("_Angle", angle);
             orientMat.SetFloat("_FlipY", flip ? 1f : 0f);
 
-
-            //display.texture = oriented;
             display.uvRect = new Rect(0f, 0f, 1f, 1f);
             display.rectTransform.localEulerAngles = Vector3.zero;
             fitter.aspectRatio = (float)w / h;
         }
 
-        void Update()
+        protected virtual void Update()
         {
+            if (!WantsWebcam) return;
+
             current.Clear();
             if (!IsReady() || !webcam.didUpdateThisFrame) return;
 
-            // Upright frame for display, then a square 640x640 copy for the modules
             Graphics.Blit(webcam, oriented, orientMat);
             Graphics.Blit(oriented, detInput);
             RefreshReadback();
 
-            // Single flip of the frame happens inside CopyFrom. Everything after reads top-down.
             frame.CopyFrom(detReadback);
             frameCount++;
 
@@ -234,7 +234,6 @@ namespace AR.Vision
                 List<Detection> detections = slot.Module.Detect(frame);
                 bool recognitionDue = slot.Module.RecognitionDue(frameCount);
 
-                // Tracking update: matching, lifecycle, recognition hook, then profile mapping.
                 slot.Tracker.Update(
                     detections,
                     resolver,
@@ -245,8 +244,6 @@ namespace AR.Vision
             }
         }
 
-        // Copies the detector input into the readback texture. Unity leaves it bottom-up;
-        // VisionFrame.CopyFrom is the one place that turns it top-down.
         void RefreshReadback()
         {
             RenderTexture previous = RenderTexture.active;
@@ -256,8 +253,6 @@ namespace AR.Vision
             RenderTexture.active = previous;
         }
 
-        // Profile mapping. Called once per active track per frame from ObservationTracker.Update.
-        // The tracker is the only caller; ToPublic() copies the result and never computes it.
         private UnityEngine.Object ResolveProfile(ObservationKind kind, string label, bool identified)
         {
             if (registry == null || !identified || string.IsNullOrEmpty(label)) return null;
@@ -312,7 +307,6 @@ namespace AR.Vision
                 t.Identified);
         }
 
-        // Call from a UI button or other script while a face is visible.
         public void EnrollLargestFace(string personName)
         {
             if (faceModule == null || !faceModule.IsReady || faceTracker == null)
@@ -343,7 +337,6 @@ namespace AR.Vision
         {
             if (!drawOverlay || display == null || oriented == null || current.Count == 0) return;
 
-            // Assumes a Screen Space - Overlay canvas, where world corners are screen pixels
             Vector3[] corners = new Vector3[4];
             ((RectTransform)transform).GetWorldCorners(corners);
 
