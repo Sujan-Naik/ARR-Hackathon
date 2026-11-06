@@ -1,61 +1,94 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using UnityEngine;
+using Stacking;
 
 namespace AR.Vision
 {
     /// <summary>
-    /// Deterministic stand-in for VisionPipeline. Emits synthetic faces/hands so the
-    /// stacking demo can be exercised without a camera or ONNX models.
+    /// Demo driver + stand-in for VisionPipeline.
     ///
-    /// Step order (matches ParticipantHandAssociation expectations):
-    ///   1  warmup            - nothing
-    ///   2  child face        - Child face appears (roles can bind with 1)
-    ///   3  barber face       - Barber face appears (roles now bind Child+Barber)
-    ///   4  parent face       - Parent face appears (optional; can be toggled off)
-    ///   5  child raise       - Child hand rises then lowers -> triggers ChildHandsInput.Placed
-    ///   6  parent left hold  - Parent's own-left hand raises and STAYS raised -> steer left
-    ///   7  parent right hold - Parent's own-right hand raises and STAYS raised -> steer right
-    ///   8  barber near       - Barber hands move near child head -> GUIDED
-    ///   9  barber away       - Barber hands move away -> HOLDING
-    ///  10  child raise again - Child raises again -> commit + respawn
+    /// Two jobs:
+    ///   1. Emit synthetic Observation records so the debug overlay, the
+    ///      association component and any HUD still have something to render.
+    ///   2. Drive the game loop DIRECTLY on a fixed script (directDrive = true),
+    ///      bypassing the pipeline's downstream adapters. For a demo the
+    ///      adapters' geometric checks are too brittle to satisfy reliably
+    ///      from synthetic keypoints.
     ///
-    /// Controls:  [N] next step   [P] toggle parent present   [Space] pause auto-advance
+    /// What the stub calls directly (directDrive):
+    ///   - StackingDirector.BeginRound()           once at startup
+    ///   - StackGame.SpawnBlock / StopBlock        to place / commit blocks
+    ///   - BlockSweepController.Steer / Release    to steer the moving block
+    ///   - StackGame.TowerRoot.localRotation       for the head-tilt demo
+    ///     (so the tilt is visible even when the pipeline's HeadPose path
+    ///      refuses to accept synthetic face keypoints)
+    ///
+    /// Tilt demo (child head roll):
+    ///   The child face rolls left/right on a sine wave (childRollAmplitude).
+    ///   The stub mirrors that roll onto the tower so the player sees the
+    ///   head-tilt experience end to end. When directDrive is OFF, tilt is
+    ///   owned entirely by StackingDirector via the pipeline's HeadTiltSignal.
+    ///
+    /// Controls:
+    ///   [P]     toggle Parent presence
+    ///   [Space] pause / resume the demo script
+    ///   [R]     restart the demo script from t = 0
+    ///   [A]     toggle direct drive vs. pipeline-only
+    ///   [T]     toggle the tilt mirror (on by default)
     /// </summary>
     public class VisionStub : VisionPipeline
     {
-        [Header("Stepping")]
-        [SerializeField] private bool autoAdvance = true;
-        [SerializeField, Min(0.5f)] private float stepSeconds = 2.5f;
+        [Header("Simulation")]
+        [SerializeField] private bool paused = false;
+        [SerializeField, Min(0.1f)] private float timeScale = 1f;
 
         [Header("Participants")]
-        [Tooltip("If false, the Parent face and Parent hands are never emitted. " +
-                 "The demo should still reach Playing with Child+Barber only.")]
+        [Tooltip("If false, the Parent face and hands are never emitted and " +
+                 "the demo script never steers. The demo still plays.")]
         [SerializeField] private bool parentEnabled = true;
 
-        [Header("Layout (normalized 0..1, top-left origin)")]
-        [SerializeField] private Vector2 childFaceCentre = new Vector2(0.30f, 0.35f);
-        [SerializeField] private Vector2 barberFaceCentre = new Vector2(0.70f, 0.35f);
+        [Header("Direct drive (demo bypass)")]
+        [SerializeField] private bool directDrive = true;
+        [SerializeField, Min(1f)] private float autoPlaceInterval = 4f;
+        [SerializeField, Min(0.5f)] private float autoSteerInterval = 2f;
+        [SerializeField, Min(0.1f)] private float autoSteerHold = 0.6f;
+
+        [Header("Faces (normalized 0..1, top-left origin)")]
+        [SerializeField] private Vector2 childFaceCentre = new Vector2(0.28f, 0.34f);
+        [SerializeField] private Vector2 barberFaceCentre = new Vector2(0.72f, 0.34f);
         [SerializeField] private Vector2 parentFaceCentre = new Vector2(0.50f, 0.80f);
-        [SerializeField, Range(0.05f, 0.4f)] private float faceSize = 0.14f;
+        [SerializeField, Range(0.05f, 0.4f)] private float faceSize = 0.18f;
+        [SerializeField] private float faceBobAmplitude = 0.008f;
+        [SerializeField] private float faceBobSpeed = 0.7f;
 
-        [Header("Child hand")]
-        [SerializeField] private float childHandRestDrop = 0.14f; // below face centre
-        [SerializeField] private float childHandRaiseBy = 0.10f; // how far up the raise goes
-        [SerializeField, Min(0.01f)] private float childRaiseDuration = 0.02f;
-        [SerializeField] private float childRaiseHoldSeconds = 0.6f;
+        [Header("Child head roll (tilt demo)")]
+        [Tooltip("Peak roll of the child's head, in degrees. The tower " +
+                 "mirrors this when tiltMirror is on.")]
+        [SerializeField] private float childRollAmplitude = 20f;
+        [SerializeField, Min(0.5f)] private float childRollPeriod = 6f;
+        [Tooltip("How quickly the mirrored tower rotation chases the head " +
+                 "roll. Matches StackingDirector.tiltLerpSpeed by default.")]
+        [SerializeField, Min(0.1f)] private float tiltLerpSpeed = 6f;
+        [Tooltip("Mirror the child's head roll onto TowerRoot when " +
+                 "directDrive is on. Turn off if StackingDirector is " +
+                 "already driving tilt via HeadPose.")]
+        [SerializeField] private bool tiltMirror = true;
 
-        [Header("Parent hands")]
-        [SerializeField] private float parentHomeDrop = 0.12f;
-        [SerializeField] private float parentRaiseBy = 0.14f;
-        [SerializeField, Min(0.01f)] private float parentRaiseDuration = 0.02f;
+        [Header("Child hands")]
+        [SerializeField] private float childHandDrop = 0.12f;
+        [SerializeField] private float childHandSpread = 0.10f;
+        [SerializeField] private float childRaiseHeight = 0.14f;
 
         [Header("Barber hands")]
-        [SerializeField] private float barberHomeDrop = 0.06f;
-        [SerializeField] private float barberNearOffset = 0.10f; // distance from barber face toward child
-        [SerializeField] private float barberFarOffset = 0.30f;
+        [SerializeField] private float barberHandDrop = 0.10f;
+        [SerializeField] private float barberHandSpread = 0.12f;
+        [SerializeField] private float barberApproachDist = 0.14f;
+        [SerializeField] private float barberCyclePeriod = 7.0f;
 
-        [Header("Head roll")]
-        [SerializeField] private float headRollSwing = 12f;
+        [Header("Parent hands")]
+        [SerializeField] private float parentHandDrop = 0.12f;
+        [SerializeField] private float parentHandSpread = 0.16f;
+        [SerializeField] private float parentRaiseHeight = 0.16f;
 
         protected override bool WantsWebcam => false;
 
@@ -65,214 +98,218 @@ namespace AR.Vision
 
         private readonly List<Observation> currentList = new List<Observation>();
         private readonly HashSet<int> lastIds = new HashSet<int>();
-        private float stepTimer;
         private float t;
 
         private const int ChildFaceId = 1;
         private const int BarberFaceId = 2;
         private const int ParentFaceId = 3;
 
-        private const int ChildHandId = 12;
+        private const int ChildLHandId = 12;
+        private const int ChildRHandId = 13;
         private const int BarberLHandId = 10;
         private const int BarberRHandId = 11;
         private const int ParentLHandId = 20;
         private const int ParentRHandId = 21;
 
-        private enum Step
-        {
-            Warmup,
-            ChildFace,
-            BarberFace,
-            ParentFace,
-            ChildRaiseSpawn,
-            ParentLeftHold,
-            ParentRightHold,
-            BarberNear,
-            BarberAway,
-            ChildRaiseCommit,
-        }
+        private StackingDirector director;
+        private StackGame stackGame;
+        private BlockSweepController sweep;
 
-        private static readonly string[] StepNames =
-        {
-            "1/10 warmup",
-            "2/10 child face appears",
-            "3/10 barber face appears (Child+Barber bound)",
-            "4/10 parent face appears (optional)",
-            "5/10 child RAISES hand -> place block",
-            "6/10 parent LEFT hand raised -> steer left",
-            "7/10 parent RIGHT hand raised -> steer right",
-            "8/10 barber hands NEAR -> GUIDED",
-            "9/10 barber hands AWAY -> HOLDING",
-            "10/10 child RAISES hand -> commit + respawn",
-        };
+        private bool armed;
+        private float nextAutoPlace;
+        private float nextAutoSteer;
+        private float steerReleaseAt = -1f;
+        private CraneSignal.Hand nextSteerHand = CraneSignal.Hand.Left;
+
+        private float currentTilt;
+
+        public bool ParentEnabled => parentEnabled;
+        public bool Paused => paused;
+        public bool DirectDrive => directDrive;
+        public bool TiltMirror => tiltMirror;
+        public float CurrentTilt => currentTilt;
 
         public string Caption { get; private set; } = "";
-        public int StepIndex { get; private set; }
-        public string StepName { get; private set; } = StepNames[0];
-        public bool ParentEnabled => parentEnabled;
+        public string StepName { get; private set; } = "simulating 3 participants";
 
         private void Awake()
         {
-            Caption = "[N] next  [P] parent  [Space] auto";
+            Caption = "[P] parent  [Space] pause  [R] reset  [A] drive  [T] tilt";
+            CacheRefs();
+        }
+
+        private void CacheRefs()
+        {
+            if (director == null) director = FindObjectOfType<StackingDirector>();
+            if (stackGame == null) stackGame = FindObjectOfType<StackGame>();
+            if (sweep == null) sweep = FindObjectOfType<BlockSweepController>();
         }
 
         private void Update()
         {
-            t += Time.deltaTime;
-
-            if (Input.GetKeyDown(KeyCode.N)) Advance();
             if (Input.GetKeyDown(KeyCode.P)) parentEnabled = !parentEnabled;
-            if (Input.GetKeyDown(KeyCode.Space)) autoAdvance = !autoAdvance;
-
-            if (autoAdvance)
+            if (Input.GetKeyDown(KeyCode.Space)) paused = !paused;
+            if (Input.GetKeyDown(KeyCode.R))
             {
-                stepTimer += Time.deltaTime;
-                if (stepTimer >= stepSeconds) Advance();
+                t = 0f;
+                lastIds.Clear();
+                armed = false;
+                currentTilt = 0f;
+                nextAutoPlace = 0f;
+                nextAutoSteer = 0f;
+                steerReleaseAt = -1f;
             }
+            if (Input.GetKeyDown(KeyCode.A)) directDrive = !directDrive;
+            if (Input.GetKeyDown(KeyCode.T)) tiltMirror = !tiltMirror;
+
+            if (!paused) t += Time.deltaTime * timeScale;
+
+            if (director == null || stackGame == null || sweep == null)
+                CacheRefs();
 
             Rebuild();
+            DriveDemo();
+            DriveTiltMirror();
         }
 
-        private void Advance()
+        private void DriveDemo()
         {
-            stepTimer = 0f;
-            StepIndex = (StepIndex + 1) % StepNames.Length;
-            StepName = StepNames[StepIndex];
+            if (!directDrive || director == null) return;
+
+            if (!armed)
+            {
+                director.BeginRound();
+                armed = true;
+                nextAutoPlace = t + autoPlaceInterval * 0.5f;
+                nextAutoSteer = t + autoSteerInterval;
+            }
+
+            if (stackGame == null) return;
+            if (stackGame.IsGameOver) return;
+            if (PauseOverlay.IsPaused) return;
+
+            if (t >= nextAutoPlace)
+            {
+                if (stackGame.IsMoving)
+                    stackGame.StopBlock();
+                else
+                    stackGame.SpawnBlock();
+                nextAutoPlace = t + autoPlaceInterval;
+            }
+
+            if (parentEnabled && sweep != null)
+            {
+                if (steerReleaseAt > 0f && t >= steerReleaseAt)
+                {
+                    sweep.ReleaseSteer();
+                    steerReleaseAt = -1f;
+                }
+
+                if (t >= nextAutoSteer && steerReleaseAt < 0f)
+                {
+                    sweep.Steer(nextSteerHand);
+                    steerReleaseAt = t + autoSteerHold;
+                    nextSteerHand = nextSteerHand == CraneSignal.Hand.Left
+                        ? CraneSignal.Hand.Right
+                        : CraneSignal.Hand.Left;
+                    nextAutoSteer = t + autoSteerInterval;
+                }
+            }
         }
 
-        // ---------------------------------------------------------------
-        // Emit
-        // ---------------------------------------------------------------
+        /// <summary>
+        /// Mirror the child's head roll onto the tower so the tilt demo is
+        /// visible even when the pipeline's HeadPose refuses to accept the
+        /// synthetic face. Skipped when directDrive is off (the director
+        /// owns tilt in that case) or when tiltMirror is off.
+        /// </summary>
+        private void DriveTiltMirror()
+        {
+            if (!directDrive || !tiltMirror) return;
+            if (stackGame == null || stackGame.TowerRoot == null) return;
+            if (PauseOverlay.IsPaused) return;
+
+            float headRoll = ComputeChildRoll();
+            currentTilt = Mathf.Lerp(currentTilt, headRoll, Time.deltaTime * tiltLerpSpeed);
+            stackGame.TowerRoot.localRotation = Quaternion.Euler(0f, 0f, currentTilt);
+        }
+
+        private float ComputeChildRoll()
+        {
+            // Matches the roll baked into the child's synthetic face keypoints.
+            return Mathf.Sin(t * (2f * Mathf.PI / Mathf.Max(0.1f, childRollPeriod))) * childRollAmplitude;
+        }
 
         private void Rebuild()
         {
             currentList.Clear();
-            Step step = (Step)StepIndex;
 
-            // Faces: Child and Barber appear first; Parent only if enabled.
-            if (step >= Step.ChildFace)
-                AddFace(ChildFaceId, childFaceCentre, RollNow());
+            float bob = Mathf.Sin(t * faceBobSpeed) * faceBobAmplitude;
+            Vector2 childFace = childFaceCentre + new Vector2(0f, bob);
+            Vector2 barberFace = barberFaceCentre + new Vector2(0f, -bob);
+            Vector2 parentFace = parentFaceCentre + new Vector2(0f, bob * 0.5f);
 
-            if (step >= Step.BarberFace)
-                AddFace(BarberFaceId, barberFaceCentre, 0f);
+            float childRoll = ComputeChildRoll();
+            AddFace(ChildFaceId, childFace, childRoll);
+            AddFace(BarberFaceId, barberFace, 0f);
+            if (parentEnabled)
+                AddFace(ParentFaceId, parentFace, 0f);
 
-            if (step >= Step.ParentFace && parentEnabled)
-                AddFace(ParentFaceId, parentFaceCentre, 0f);
+            float raiseT = (nextAutoPlace - t < autoPlaceInterval * 0.5f) ? 1f : 0f;
+            Vector2 childLHome = childFace + new Vector2(-childHandSpread * 0.5f, childHandDrop);
+            Vector2 childRHome = childFace + new Vector2(childHandSpread * 0.5f, childHandDrop);
+            AddHand(ChildLHandId, childLHome + new Vector2(0f, -childRaiseHeight * raiseT), false);
+            AddHand(ChildRHandId, childRHome + new Vector2(0f, -childRaiseHeight * raiseT), false);
 
-            // Child hand: present from ChildRaiseSpawn onward.
-            if (step >= Step.ChildRaiseSpawn)
+            float barberPhase = (Mathf.Sin(t * (2f * Mathf.PI / Mathf.Max(0.1f, barberCyclePeriod))) + 1f) * 0.5f;
+            Vector2 barberLHome = barberFace + new Vector2(-barberHandSpread * 0.5f, barberHandDrop);
+            Vector2 barberRHome = barberFace + new Vector2(barberHandSpread * 0.5f, barberHandDrop);
+            Vector2 barberLTarget = Vector2.Lerp(barberLHome, childFace, Mathf.Clamp01(barberApproachDist / Mathf.Max(0.01f, Vector2.Distance(barberLHome, childFace))));
+            Vector2 barberRTarget = Vector2.Lerp(barberRHome, childFace, Mathf.Clamp01(barberApproachDist / Mathf.Max(0.01f, Vector2.Distance(barberRHome, childFace))));
+            AddHand(BarberLHandId, Vector2.Lerp(barberLHome, barberLTarget, barberPhase), false);
+            AddHand(BarberRHandId, Vector2.Lerp(barberRHome, barberRTarget, barberPhase), false);
+
+            if (parentEnabled)
             {
-                Vector2 rest = childFaceCentre + new Vector2(0f, childHandRestDrop);
-                Vector2 up = rest - new Vector2(0f, childHandRaiseBy);
+                Vector2 parentLHome = parentFace + new Vector2(-parentHandSpread * 0.5f, parentHandDrop);
+                Vector2 parentRHome = parentFace + new Vector2(parentHandSpread * 0.5f, parentHandDrop);
 
-                bool isRaiseStep = step == Step.ChildRaiseSpawn || step == Step.ChildRaiseCommit;
-                float raiseT = isRaiseStep ? Mathf.Clamp01(stepTimer / childRaiseDuration) : 0f;
+                bool leftSteering = steerReleaseAt > 0f && nextSteerHand == CraneSignal.Hand.Right;
+                bool rightSteering = steerReleaseAt > 0f && nextSteerHand == CraneSignal.Hand.Left;
 
-                Vector2 pos;
-                if (isRaiseStep && stepTimer <= childRaiseHoldSeconds)
-                    pos = Vector2.Lerp(rest, up, raiseT);
-                else
-                    pos = rest;
-
-                AddHand(ChildHandId, pos, closed: false);
-                Caption = isRaiseStep
-                    ? "Child RAISE t=" + stepTimer.ToString("0.00") + "s"
-                    : "Child idle";
+                AddHand(ParentLHandId, parentLHome + new Vector2(0f, -parentRaiseHeight * (leftSteering ? 1f : 0f)), false);
+                AddHand(ParentRHandId, parentRHome + new Vector2(0f, -parentRaiseHeight * (rightSteering ? 1f : 0f)), false);
             }
 
-            // Parent hands: only when parent enabled and we're in a parent step.
-            if (parentEnabled && (step == Step.ParentLeftHold || step == Step.ParentRightHold))
-            {
-                Vector2 homeL = parentFaceCentre + new Vector2(-0.10f, parentHomeDrop);
-                Vector2 homeR = parentFaceCentre + new Vector2(0.10f, parentHomeDrop);
-                float raiseT = Mathf.Clamp01(stepTimer / parentRaiseDuration);
-
-                if (step == Step.ParentLeftHold)
-                {
-                    Vector2 up = homeL - new Vector2(0f, parentRaiseBy);
-                    AddHand(ParentLHandId, Vector2.Lerp(homeL, up, raiseT), closed: false);
-                    AddHand(ParentRHandId, homeR, closed: false);
-                    Caption = raiseT >= 1f ? "Parent LEFT raised (hold) -> steer left" : "Parent LEFT raising...";
-                }
-                else
-                {
-                    Vector2 up = homeR - new Vector2(0f, parentRaiseBy);
-                    AddHand(ParentLHandId, homeL, closed: false);
-                    AddHand(ParentRHandId, Vector2.Lerp(homeR, up, raiseT), closed: false);
-                    Caption = raiseT >= 1f ? "Parent RIGHT raised (hold) -> steer right" : "Parent RIGHT raising...";
-                }
-            }
-            else if (parentEnabled && (step == Step.ParentFace || step == Step.ChildRaiseSpawn))
-            {
-                // Parent present but hands at rest.
-                Vector2 homeL = parentFaceCentre + new Vector2(-0.10f, parentHomeDrop);
-                Vector2 homeR = parentFaceCentre + new Vector2(0.10f, parentHomeDrop);
-                AddHand(ParentLHandId, homeL, closed: false);
-                AddHand(ParentRHandId, homeR, closed: false);
-            }
-
-            // Barber hands: home beside the barber face; NEAR moves them toward the child,
-            // but not so close that the child face steals ownership of the barber's hands.
-            if (step >= Step.BarberFace)
-            {
-                Vector2 homeL = barberFaceCentre + new Vector2(-0.06f, barberHomeDrop);
-                Vector2 homeR = barberFaceCentre + new Vector2(0.06f, barberHomeDrop);
-
-                if (step == Step.BarberNear)
-                {
-                    // Close enough to the child head to satisfy guideEnterDistance (0.12),
-                    // but still nearer to the barber face than to the child face so the
-                    // association keeps these hands bound to Barber.
-                    Vector2 nearL = new Vector2(childFaceCentre.x + 0.16f, childFaceCentre.y + 0.02f);
-                    Vector2 nearR = new Vector2(childFaceCentre.x + 0.20f, childFaceCentre.y + 0.02f);
-                    AddHand(BarberLHandId, nearL, closed: false);
-                    AddHand(BarberRHandId, nearR, closed: false);
-                    Caption = "Barber NEAR child -> GUIDED";
-                }
-                else if (step == Step.BarberAway)
-                {
-                    // Far from child, near barber face.
-                    AddHand(BarberLHandId, homeL - new Vector2(barberFarOffset * 0.2f, 0f), closed: false);
-                    AddHand(BarberRHandId, homeR + new Vector2(barberFarOffset * 0.2f, 0f), closed: false);
-                    Caption = "Barber AWAY from child -> HOLDING";
-                }
-                else
-                {
-                    AddHand(BarberLHandId, homeL, closed: false);
-                    AddHand(BarberRHandId, homeR, closed: false);
-                }
-            }
+            Caption =
+                (directDrive ? "[DIRECT DRIVE] " : "[PIPELINE ONLY] ") +
+                (parentEnabled ? "3 participants" : "2 participants (Parent OFF)") +
+                "  tilt=" + currentTilt.ToString("0.0") + "\u00B0" +
+                "  t=" + t.ToString("0.0") + "s" +
+                (paused ? "  PAUSED" : "");
 
             PublishDiff();
-        }
-
-        private float RollNow()
-        {
-            Step s = (Step)StepIndex;
-            if (s < Step.BarberNear) return 0f;
-            if (s == Step.BarberNear) return Mathf.Sin(t * 1.2f) * headRollSwing;
-            return Mathf.Sin(t * 1.2f) * headRollSwing * 1.6f;
         }
 
         private void AddFace(int id, Vector2 c, float rollDeg)
         {
             float half = faceSize * 0.5f;
             float r = rollDeg * Mathf.Deg2Rad;
-            Vector2 le = c + Rot(new Vector2(-half * 0.4f, -half * 0.15f), r);
-            Vector2 re = c + Rot(new Vector2(half * 0.4f, -half * 0.15f), r);
-            Vector2 no = c + Rot(Vector2.zero, r);
-            Vector2 ml = c + Rot(new Vector2(-half * 0.3f, half * 0.35f), r);
-            Vector2 mr = c + Rot(new Vector2(half * 0.3f, half * 0.35f), r);
+            Vector2 le = c + Rot(new Vector2(-half * 0.35f, -half * 0.15f), r);
+            Vector2 re = c + Rot(new Vector2(half * 0.35f, -half * 0.15f), r);
+            Vector2 no = c;
+            Vector2 ml = c + Rot(new Vector2(-half * 0.30f, half * 0.35f), r);
+            Vector2 mr = c + Rot(new Vector2(half * 0.30f, half * 0.35f), r);
             var rect = Rect.MinMaxRect(c.x - half, c.y - half, c.x + half, c.y + half);
             currentList.Add(new Observation(id, ObservationKind.Face, "unknown", null,
-                0.9f, 0f, rect, new[] { le, re, no, ml, mr }, 1, false));
+                0.95f, 0f, rect, new[] { le, re, no, ml, mr }, 1, false));
         }
 
         private void AddHand(int id, Vector2 c, bool closed)
         {
             var rect = Rect.MinMaxRect(c.x - 0.06f, c.y - 0.06f, c.x + 0.06f, c.y + 0.06f);
             currentList.Add(new Observation(id, ObservationKind.Hand, "Left", null,
-                0.9f, 0f, rect, BuildHandJoints(c, closed), 1, true));
+                0.95f, 0f, rect, BuildHandJoints(c, closed), 1, true));
         }
 
         private static Vector2[] BuildHandJoints(Vector2 wrist, bool closed)
@@ -280,28 +317,30 @@ namespace AR.Vision
             var kp = new Vector2[21];
             kp[0] = wrist;
 
-            float mid = closed ? 0.012f : 0.028f;
-            float tip = closed ? 0.006f : 0.060f;
-            F(kp, 1, 2, 3, 4, wrist, -0.030f, 0f, mid, tip, -0.010f);
-            F(kp, 5, 6, 7, 8, wrist, -0.020f, 0f, mid, tip, -0.020f);
-            F(kp, 9, 10, 11, 12, wrist, -0.005f, 0f, mid, tip, 0.000f);
-            F(kp, 13, 14, 15, 16, wrist, 0.008f, 0f, mid, tip, 0.010f);
-            F(kp, 17, 18, 19, 20, wrist, 0.020f, 0f, mid, tip, 0.020f);
+            float[] xoff = { -0.030f, -0.018f, -0.004f, 0.012f, 0.026f };
+            float[] drift = { -0.010f, -0.005f, 0.000f, 0.005f, 0.010f };
+
+            for (int f = 0; f < 5; f++)
+            {
+                int b = 1 + f * 4;
+                Vector2 basePos = wrist + new Vector2(xoff[f], -0.005f);
+
+                if (closed)
+                {
+                    kp[b + 0] = basePos;
+                    kp[b + 1] = basePos + new Vector2(drift[f] * 0.3f, -0.012f);
+                    kp[b + 2] = basePos + new Vector2(drift[f] * 0.5f, -0.008f);
+                    kp[b + 3] = basePos + new Vector2(drift[f] * 0.4f, -0.002f);
+                }
+                else
+                {
+                    kp[b + 0] = basePos;
+                    kp[b + 1] = basePos + new Vector2(drift[f] * 0.3f, -0.030f);
+                    kp[b + 2] = basePos + new Vector2(drift[f] * 0.5f, -0.060f);
+                    kp[b + 3] = basePos + new Vector2(drift[f] * 0.6f, -0.090f);
+                }
+            }
             return kp;
-        }
-
-        private static void F(Vector2[] kp, int a, int b, int c, int d,
-                             Vector2 w, float xoff, float yoff, float mid, float tip, float drift)
-        {
-            bool closed = tip < mid;
-
-            Vector2 p0 = w + new Vector2(xoff, yoff);
-            Vector2 p1 = p0 + new Vector2(drift * 0.3f, -mid);
-            Vector2 p2 = p1 + new Vector2(drift * 0.3f, -mid * 0.6f);
-            Vector2 p3 = closed
-                ? p0 + new Vector2(drift * 0.2f, -mid * 0.3f)
-                : p2 + new Vector2(drift * 0.4f, -tip * 0.6f);
-            kp[a] = p0; kp[b] = p1; kp[c] = p2; kp[d] = p3;
         }
 
         private static Vector2 Rot(Vector2 v, float r)
@@ -309,10 +348,6 @@ namespace AR.Vision
             float cs = Mathf.Cos(r), sn = Mathf.Sin(r);
             return new Vector2(v.x * cs - v.y * sn, v.x * sn + v.y * cs);
         }
-
-        // ---------------------------------------------------------------
-        // Diff (appeared/updated/lost events)
-        // ---------------------------------------------------------------
 
         private void PublishDiff()
         {
@@ -334,11 +369,7 @@ namespace AR.Vision
             foreach (int id in nowIds) lastIds.Add(id);
         }
 
-        // ---------------------------------------------------------------
-        // Debug HUD
-        // ---------------------------------------------------------------
-
-        private void OnGUI() { DrawBoxes(); DrawHud(); }
+        private void OnGUI() { DrawBoxes(); DrawHud(); DrawTiltIndicator(); }
 
         private void DrawBoxes()
         {
@@ -348,12 +379,17 @@ namespace AR.Vision
                 Observation o = currentList[i];
                 Color c;
                 if (o.Kind == ObservationKind.Face)
-                    c = o.TrackId == ChildFaceId
-                        ? new Color(0.3f, 0.8f, 1f, 0.9f)
-                        : new Color(0.9f, 0.9f, 0.9f, 0.6f);
+                {
+                    switch (o.TrackId)
+                    {
+                        case ChildFaceId: c = new Color(0.3f, 0.8f, 1f, 0.9f); break;
+                        case BarberFaceId: c = new Color(0.2f, 1f, 0.5f, 0.9f); break;
+                        default: c = new Color(0.9f, 0.9f, 0.9f, 0.6f); break;
+                    }
+                }
                 else if (o.TrackId == ParentLHandId || o.TrackId == ParentRHandId)
                     c = new Color(1f, 0.6f, 0.2f, 0.9f);
-                else if (o.TrackId == ChildHandId)
+                else if (o.TrackId == ChildLHandId || o.TrackId == ChildRHandId)
                     c = new Color(0.6f, 1f, 0.9f, 0.9f);
                 else
                     c = new Color(0.2f, 1f, 0.5f, 0.9f);
@@ -390,9 +426,79 @@ namespace AR.Vision
             GUI.DrawTexture(new Rect(r.xMax - th, r.yMin, th, r.height), Texture2D.whiteTexture);
         }
 
+        /// <summary>
+        /// Small compass-like dial on the left side that shows the live roll
+        /// angle, so the tilt demo is legible even if the tower is off-screen
+        /// or occluded by the HUD.
+        /// </summary>
+        private void DrawTiltIndicator()
+        {
+            const float R = 44f;
+            float cx = 70f;
+            float cy = Screen.height * 0.5f;
+
+            var prev = GUI.color;
+
+            // Backing disc.
+            GUI.color = new Color(0f, 0f, 0f, 0.55f);
+            var disc = new Rect(cx - R, cy - R, R * 2f, R * 2f);
+            GUI.DrawTexture(disc, Texture2D.whiteTexture);
+
+            // Horizontal reference line.
+            GUI.color = new Color(1f, 1f, 1f, 0.35f);
+            GUI.DrawTexture(new Rect(cx - R, cy - 1f, R * 2f, 2f), Texture2D.whiteTexture);
+
+            // Tilted line showing the live roll.
+            float rad = currentTilt * Mathf.Deg2Rad;
+            Vector2 dir = new Vector2(Mathf.Cos(rad + Mathf.PI * 0.5f), Mathf.Sin(rad + Mathf.PI * 0.5f));
+            Vector2 a = new Vector2(cx, cy) - dir * (R - 6f);
+            Vector2 b = new Vector2(cx, cy) + dir * (R - 6f);
+            DrawThickLine(a, b, 3f, new Color(1f, 0.85f, 0.3f, 1f));
+
+            // Tick marks every 30 degrees.
+            GUI.color = new Color(1f, 1f, 1f, 0.25f);
+            for (int i = 0; i < 12; i++)
+            {
+                float a2 = i * 30f * Mathf.Deg2Rad;
+                Vector2 outer = new Vector2(cx + Mathf.Cos(a2) * (R - 4f), cy + Mathf.Sin(a2) * (R - 4f));
+                Vector2 inner = new Vector2(cx + Mathf.Cos(a2) * (R - 10f), cy + Mathf.Sin(a2) * (R - 10f));
+                DrawThickLine(inner, outer, 1f, GUI.color);
+            }
+
+            GUI.color = prev;
+
+            // Label under the dial.
+            if (_style == null) _style = new GUIStyle(GUI.skin.label) { fontSize = 12 };
+            _style.fontStyle = FontStyle.Bold;
+            _style.alignment = TextAnchor.MiddleCenter;
+            _style.normal.textColor = Color.white;
+            GUI.Label(new Rect(cx - R, cy + R + 4f, R * 2f, 18f),
+                "tilt " + currentTilt.ToString("+0.0;-0.0;0.0") + "\u00B0", _style);
+            _style.alignment = TextAnchor.UpperLeft;
+            _style.fontStyle = FontStyle.Normal;
+        }
+
+        private static void DrawThickLine(Vector2 a, Vector2 b, float thickness, Color color)
+        {
+            var prev = GUI.color;
+            GUI.color = color;
+
+            Vector2 d = b - a;
+            float len = d.magnitude;
+            if (len < 0.01f) { GUI.color = prev; return; }
+            float angle = Mathf.Atan2(d.y, d.x) * Mathf.Rad2Deg;
+
+            Matrix4x4 m = GUI.matrix;
+            GUIUtility.RotateAroundPivot(angle, a);
+            GUI.DrawTexture(new Rect(a.x, a.y - thickness * 0.5f, len, thickness), Texture2D.whiteTexture);
+            GUI.matrix = m;
+
+            GUI.color = prev;
+        }
+
         private void DrawHud()
         {
-            const float w = 780f, h = 260f, pad = 12f;
+            const float w = 780f, h = 300f, pad = 12f;
             var panel = new Rect(pad, Screen.height - h - pad, w, h);
 
             var prev = GUI.color;
@@ -402,32 +508,34 @@ namespace AR.Vision
 
             float y = panel.y + 6, x = panel.x + 10;
 
-            var director = FindObjectOfType<Stacking.StackingDirector>();
-            var sweep = FindObjectOfType<Stacking.BlockSweepController>();
-            var childIn = FindObjectOfType<Stacking.ChildHandsInput>();
-            var parentIn = FindObjectOfType<Stacking.ParentHandsInput>();
-            var game = FindObjectOfType<StackGame>();
+            var childIn = FindObjectOfType<ChildHandsInput>();
+            var parentIn = FindObjectOfType<ParentHandsInput>();
 
             L(ref y, x, w, "VISION STUB - " + StepName, true, Color.white);
             L(ref y, x, w, "Caption: " + Caption, false, new Color(0.85f, 0.9f, 1f));
             L(ref y, x, w,
-                "[N] next  [P] parent=" + (parentEnabled ? "ON" : "OFF") +
-                "  auto=" + autoAdvance + " (" + stepTimer.ToString("0.00") + "s)",
+                "[P] parent=" + (parentEnabled ? "ON" : "OFF") +
+                "  [Space] paused=" + paused +
+                "  [A] drive=" + (directDrive ? "DIRECT" : "PIPELINE") +
+                "  [T] tilt=" + (tiltMirror ? "ON" : "OFF") +
+                "  [R] reset  t=" + t.ToString("0.00") + "s",
                 false, Color.white);
-            L(ref y, x, w, "obs=" + currentList.Count, false, Color.white);
+            L(ref y, x, w,
+                "obs=" + currentList.Count +
+                "  headRoll=" + ComputeChildRoll().ToString("+0.0;-0.0;0.0") + "\u00B0" +
+                "  towerTilt=" + currentTilt.ToString("+0.0;-0.0;0.0") + "\u00B0",
+                false, new Color(1f, 0.9f, 0.6f));
 
             if (director != null)
             {
                 L(ref y, x, w,
                     "Phase=" + director.CurrentPhase +
+                    "  armed=" + director.IsArmed +
                     "  GUIDED=" + director.BarberGuiding +
                     "  HeldTilt=" + director.HeldTilt.ToString("0.0") +
-                    "  CurrentTilt=" + director.CurrentTilt.ToString("0.0") +
+                    "  DirectorTilt=" + director.CurrentTilt.ToString("0.0") +
                     "  Match=" + director.Match,
                     false, Color.white);
-                L(ref y, x, w,
-                    "ParentRaisingHand=" + director.ParentRaisingHand,
-                    false, new Color(1f, 0.8f, 0.5f));
             }
 
             if (childIn != null)
@@ -450,11 +558,11 @@ namespace AR.Vision
                     "  IsSweeping=" + sweep.IsSweeping,
                     false, new Color(0.8f, 1f, 0.7f));
 
-            if (game != null)
+            if (stackGame != null)
                 L(ref y, x, w,
-                    "Moving=" + game.IsMoving +
-                    "  Score=" + game.Score +
-                    "  GameOver=" + game.IsGameOver,
+                    "Moving=" + stackGame.IsMoving +
+                    "  Score=" + stackGame.Score +
+                    "  GameOver=" + stackGame.IsGameOver,
                     false, Color.white);
         }
 

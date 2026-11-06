@@ -4,7 +4,22 @@ using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.UI;
 
-/// <summary>3D-only block stacking game. Cubes with real gravity.</summary>
+/// <summary>
+/// 3D block stacking game.
+///
+/// The tower is treated as being HELD by the barber: its orientation is set
+/// by the tilt pivot (barber hands -> director -> TowerRoot), and blocks are
+/// stacked in the tower's LOCAL frame. "Down" for the tower is its local -Y,
+/// not world -Y. That means tilting the tower does not cause blocks to slide
+/// sideways off each other, because gravity in the tower's frame points at
+/// the tower's base.
+///
+/// Detached blocks ("dropped" on a miss) are also simulated in the tower's
+/// frame: world gravity applied to them is first rotated by the inverse of
+/// the tower's current tilt, so they fall along the tower walls rather than
+/// toward world-down. This makes the visual "held by barber" illusion
+/// consistent for both stacked and falling blocks.
+/// </summary>
 public class StackGame : MonoBehaviour
 {
     [Header("Grid")]
@@ -29,8 +44,31 @@ public class StackGame : MonoBehaviour
     [SerializeField] public Camera cam;
     [SerializeField, Min(0f)] public float cameraFollowSpeed = 3f;
 
+    [Header("Camera fit")]
+    [SerializeField] private bool cameraFitEnabled = true;
+    [SerializeField, Range(0f, 0.4f)] private float cameraFitPaddingX = 0.10f;
+    [SerializeField, Range(0f, 0.4f)] private float cameraFitPaddingY = 0.12f;
+    [SerializeField, Min(0f)] private float cameraFitWorldMargin = 0.5f;
+    [SerializeField, Min(0.5f)] private float cameraFitMinSize = 3f;
+    [SerializeField, Min(0f)] private float cameraFitLerp = 3f;
+
+    [Header("Tilt visual juice")]
+    [SerializeField, Min(0.01f)] private float tiltSmoothTime = 0.18f;
+    [SerializeField, Min(0f)] private float tiltOvershoot = 4f;
+    [SerializeField, Min(0.1f)] private float tiltOvershootDecay = 6f;
+
+    [Header("Tower-as-held physics")]
+    [Tooltip("Rotate world gravity into the tower's local frame for " +
+             "detached blocks. When true, blocks fall along the tower's " +
+             "own -Y axis (barber holding the tower). When false, they " +
+             "fall toward world-down.")]
+    [SerializeField] private bool gravityFollowsTower = true;
+    [Tooltip("Multiplier applied to gravity for detached blocks. 0 = they " +
+             "float in place (purely visual drop), 1 = full gravity in the " +
+             "tower's frame.")]
+    [SerializeField, Min(0f)] private float detachedGravityScale = 1f;
+
     [Header("Startup")]
-    [Tooltip("If true and no KidsSalonGameFlow exists in the scene, the game starts itself on scene load. Leave OFF so nothing is built until RestartGame() is called.")]
     [SerializeField] private bool autoStartIfNoFlow = false;
 
     [Header("Vision steering")]
@@ -53,11 +91,16 @@ public class StackGame : MonoBehaviour
     public bool IsMoving => movingRow != null;
     public bool HasStarted => gameStarted;
     public Transform TowerRoot => towerRoot;
+    public Transform TiltPivot => towerPivot;
+
+    /// <summary>Current lean of the tower in degrees (Z).</summary>
+    public float CurrentTiltDegrees => towerCurrentTilt;
 
     public event Action<int> ScoreChanged;
     public event Action<int> GameOver;
 
     private Transform towerRoot;
+    private Transform towerPivot;
     private Transform movingRow;
     private int rowIndex;
     private int prevStart;
@@ -75,15 +118,33 @@ public class StackGame : MonoBehaviour
     private bool hasSteerTarget;
     private float steerTargetPos;
 
-    // Blocks detached by Drop(). Tracked so a restart removes only these,
-    // never unrelated Rigidbodies elsewhere in the scene.
-    private readonly List<GameObject> droppedBlocks = new List<GameObject>();
+    // Tilt visual state.
+    private float towerTargetTilt;
+    private float towerCurrentTilt;
+    private float towerTiltVelocity;
+    private float towerOvershoot;
+    private float lastAppliedTargetTilt;
 
+    // Per-drop physics: gravity override state.
+    private sealed class DetachedBlock
+    {
+        public GameObject go;
+        public Rigidbody body;
+    }
+    private readonly List<DetachedBlock> detached = new List<DetachedBlock>();
+
+    // Camera state.
     private Vector3 cameraStartPosition;
     private Quaternion cameraStartRotation;
     private bool cameraStartOrthographic;
     private float cameraStartOrthographicSize;
     private bool cameraCaptured;
+
+    private Vector3 cameraTargetPosition;
+    private float cameraTargetSize;
+    private bool cameraTargetValid;
+
+    private readonly List<Renderer> rendererScratch = new List<Renderer>();
 
     private void Awake()
     {
@@ -94,14 +155,11 @@ public class StackGame : MonoBehaviour
 
     private void OnEnable()
     {
-        // Only take over the camera if a game is actually running.
         if (initialized && gameStarted) ConfigureCameraForGame();
     }
 
     private void Start()
     {
-        // Scene load is inert: no rows are built here. The game begins only
-        // when RestartGame() is called (by KidsSalonGameFlow or the restart button).
         EnsureInitialized();
 
         if (autoStartIfNoFlow && FindObjectOfType<KidsSalonGameFlow>() == null)
@@ -142,19 +200,135 @@ public class StackGame : MonoBehaviour
             if (Input.GetKeyDown(stopKey) || MousePressedOutsideUI(0)) StopBlock();
         }
 
-        FollowTowerWithCamera();
         RefreshCanvasUI();
     }
 
-    /// <summary>Starts (or restarts) the game. This is the only place Row 0 is built.</summary>
+    private void LateUpdate()
+    {
+        UpdateTowerTiltVisual();
+        UpdateDetachedPhysics();
+        UpdateCameraFit();
+    }
+
+    // ---------------------------------------------------------------------
+    // Held-tower tilt
+    // ---------------------------------------------------------------------
+
+    private void UpdateTowerTiltVisual()
+    {
+        if (towerRoot == null) return;
+        EnsureTowerPivot();
+
+        // Read the angle the director wrote this frame, then undo it on
+        // TowerRoot and reapply a smoothed version to the pivot.
+        float requestedZ = Mathf.DeltaAngle(0f, towerRoot.localEulerAngles.z);
+        towerTargetTilt = requestedZ;
+
+        if (tiltOvershoot > 0.01f)
+        {
+            float delta = Mathf.DeltaAngle(lastAppliedTargetTilt, requestedZ);
+            if (Mathf.Abs(delta) > 1f)
+                towerOvershoot = Mathf.Clamp(towerOvershoot + delta * 0.25f, -tiltOvershoot, tiltOvershoot);
+        }
+        lastAppliedTargetTilt = requestedZ;
+
+        towerOvershoot = Mathf.Lerp(towerOvershoot, 0f, 1f - Mathf.Exp(-tiltOvershootDecay * Time.deltaTime));
+
+        float desired = requestedZ + towerOvershoot;
+        towerCurrentTilt = Mathf.SmoothDampAngle(
+            towerCurrentTilt, desired, ref towerTiltVelocity,
+            Mathf.Max(0.001f, tiltSmoothTime), Mathf.Infinity, Time.deltaTime);
+
+        towerRoot.localRotation = Quaternion.identity;
+        towerPivot.localRotation = Quaternion.Euler(0f, 0f, towerCurrentTilt);
+    }
+
+    private void EnsureTowerPivot()
+    {
+        if (towerPivot != null && towerPivot.parent == towerRoot) return;
+
+        Transform existing = towerRoot.Find("TiltPivot");
+        if (existing != null) { towerPivot = existing; return; }
+
+        GameObject pivotGo = new GameObject("TiltPivot");
+        towerPivot = pivotGo.transform;
+        towerPivot.SetParent(towerRoot, false);
+        towerPivot.localPosition = Vector3.zero;
+        towerPivot.localRotation = Quaternion.identity;
+        towerPivot.localScale = Vector3.one;
+
+        for (int i = towerRoot.childCount - 1; i >= 0; i--)
+        {
+            Transform c = towerRoot.GetChild(i);
+            if (c == towerPivot) continue;
+            c.SetParent(towerPivot, true);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Detached-block physics in the tower's frame
+    //
+    // "Barber holds the tower": gravity for anything attached to the
+    // tower is effectively along the tower's own -Y. Detached blocks
+    // are parented to the world so they can fall, but their gravity is
+    // overridden each FixedUpdate to be the world-space vector that,
+    // in the tower's frame, points along local -Y.
+    // ---------------------------------------------------------------------
+
+    private void UpdateDetachedPhysics()
+    {
+        if (detached.Count == 0) return;
+
+        Quaternion towerRot = towerPivot != null ? towerPivot.rotation : Quaternion.identity;
+        Vector3 worldDown = Physics.gravity;
+
+        // In the tower's frame, world-down becomes (towerRot^-1 * worldDown).
+        // We want the detached block to fall along tower-local -Y, so:
+        //   worldGravityForBlock = towerRot * (local -Y) * |g|
+        // Which is -towerRot.up * magnitude.
+        Vector3 towerFrameGravity;
+        if (gravityFollowsTower)
+            towerFrameGravity = -(towerRot * Vector3.up) * Mathf.Abs(Physics.gravity.magnitude) * detachedGravityScale;
+        else
+            towerFrameGravity = worldDown * detachedGravityScale;
+
+        for (int i = detached.Count - 1; i >= 0; i--)
+        {
+            DetachedBlock d = detached[i];
+            if (d == null || d.go == null) { detached.RemoveAt(i); continue; }
+
+            if (d.body != null)
+            {
+                // Clear per-body gravity override (Unity doesn't have one
+                // built-in for rigidbodies), so we approximate by applying
+                // a custom force each FixedUpdate.
+
+                // UseForce: apply force = mass * (desired - Physics.gravity).
+                // This cancels the built-in Physics.gravity and replaces it
+                // with towerFrameGravity.
+                Vector3 cancel = -Physics.gravity;
+                Vector3 apply = towerFrameGravity;
+                d.body.AddForce((cancel + apply) * d.body.mass, ForceMode.Force);
+            }
+        }
+    }
+
+    /// <summary>Starts (or restarts) the game.</summary>
     public void RestartGame()
     {
         EnsureInitialized();
 
         if (towerRoot != null) Destroy(towerRoot.gameObject);
         towerRoot = new GameObject("Stack Tower").transform;
+        towerPivot = null;
+        towerCurrentTilt = 0f;
+        towerTargetTilt = 0f;
+        towerTiltVelocity = 0f;
+        towerOvershoot = 0f;
+        lastAppliedTargetTilt = 0f;
+        EnsureTowerPivot();
 
-        ClearDroppedBlocks();
+        ClearDetached();
 
         gameStarted = true;
         movingRow = null;
@@ -198,7 +372,6 @@ public class StackGame : MonoBehaviour
         hasSteerTarget = true;
     }
 
-    /// <summary>Hands control back to the built-in sweep.</summary>
     public void ReleaseSteering()
     {
         steerByExternalInput = false;
@@ -231,16 +404,18 @@ public class StackGame : MonoBehaviour
 
     private void SetRowCellPosition(Transform row, float cellX, int cellY)
     {
-        row.position = new Vector3(cellX, cellY, 0f);
+        row.localPosition = new Vector3(cellX, cellY, 0f);
     }
 
     private Transform BuildRow(int cells, int y, int startCell)
     {
+        EnsureTowerPivot();
+
         Transform row = new GameObject("Row " + y).transform;
         Color color = Color.HSVToRGB((y * 0.07f) % 1f, 0.6f, 0.95f);
 
-        row.SetParent(towerRoot, false);
-        row.position = new Vector3(startCell, y, 0f);
+        row.SetParent(towerPivot, false);
+        row.localPosition = new Vector3(startCell, y, 0f);
 
         for (int i = 0; i < cells; i++)
         {
@@ -277,11 +452,133 @@ public class StackGame : MonoBehaviour
     {
         if (cam == null) return;
         cam.orthographic = true;
-        ApplyFraming(instant: true);
         cam.transform.rotation = Quaternion.identity;
+        cameraTargetValid = false;
+        ApplyFraming(instant: true);
+    }
+
+    private void UpdateCameraFit()
+    {
+        if (!cameraFitEnabled) { FollowTowerWithCamera(); return; }
+        ApplyFraming(instant: false);
     }
 
     private void ApplyFraming(bool instant)
+    {
+        if (cam == null) return;
+
+        if (!TryComputeTowerBounds(out Bounds worldBounds))
+        {
+            ComputeColumnsFallback(out Vector3 fbPos, out float fbSize);
+            worldBounds = new Bounds(fbPos, new Vector3(columns, Mathf.Max(1f, rowIndex) + 2f, 1f));
+            if (instant)
+            {
+                cam.orthographicSize = Mathf.Max(fbSize, cameraFitMinSize);
+                cam.transform.position = new Vector3(fbPos.x, fbPos.y, -10f);
+            }
+            else
+            {
+                float k0 = Time.deltaTime * cameraFollowSpeed;
+                cam.orthographicSize = Mathf.Lerp(cam.orthographicSize, Mathf.Max(fbSize, cameraFitMinSize), k0);
+                Vector3 target0 = new Vector3(fbPos.x, fbPos.y, -10f);
+                cam.transform.position = Vector3.Lerp(cam.transform.position, target0, k0);
+            }
+            cameraTargetValid = true;
+            return;
+        }
+
+        worldBounds.Expand(new Vector3(
+            cameraFitWorldMargin * 2f,
+            cameraFitWorldMargin * 2f,
+            cameraFitWorldMargin * 2f));
+
+        float aspect = Mathf.Max(0.1f, cam.aspect);
+        float planeZ = worldBounds.center.z;
+        float currentZ = cam.transform.position.z;
+        float distance = Mathf.Abs(currentZ - planeZ);
+        if (distance < 0.1f) distance = 10f;
+
+        if (cam.orthographic)
+        {
+            float halfHeight = worldBounds.extents.y;
+            float halfWidth = worldBounds.extents.x;
+            float sizeFromHeight = halfHeight / Mathf.Max(0.01f, (1f - cameraFitPaddingY));
+            float sizeFromWidth = halfWidth / Mathf.Max(0.01f, aspect * (1f - cameraFitPaddingX));
+            cameraTargetSize = Mathf.Max(sizeFromHeight, sizeFromWidth, cameraFitMinSize);
+            cameraTargetPosition = new Vector3(worldBounds.center.x, worldBounds.center.y, currentZ);
+        }
+        else
+        {
+            float vFov = cam.fieldOfView * Mathf.Deg2Rad;
+            float hFov = 2f * Mathf.Atan(Mathf.Tan(vFov * 0.5f) * aspect);
+
+            float fitHeightDist = worldBounds.extents.y / Mathf.Tan(vFov * 0.5f * Mathf.Max(0.01f, (1f - cameraFitPaddingY)));
+            float fitWidthDist = worldBounds.extents.x / Mathf.Tan(hFov * 0.5f * Mathf.Max(0.01f, (1f - cameraFitPaddingX)));
+            float targetDist = Mathf.Max(fitHeightDist, fitWidthDist) + worldBounds.extents.z;
+
+            Vector3 forward = cam.transform.forward;
+            if (forward.sqrMagnitude < 1e-4f) forward = Vector3.forward;
+            cameraTargetPosition = worldBounds.center - forward * targetDist;
+        }
+
+        if (instant)
+        {
+            if (cam.orthographic) cam.orthographicSize = cameraTargetSize;
+            cam.transform.position = cameraTargetPosition;
+        }
+        else
+        {
+            float k = 1f - Mathf.Exp(-Mathf.Max(0.01f, cameraFitLerp) * Time.deltaTime);
+            if (cam.orthographic)
+                cam.orthographicSize = Mathf.Lerp(cam.orthographicSize, cameraTargetSize, k);
+            cam.transform.position = Vector3.Lerp(cam.transform.position, cameraTargetPosition, k);
+        }
+
+        cameraTargetValid = true;
+    }
+
+    private bool TryComputeTowerBounds(out Bounds bounds)
+    {
+        bounds = default;
+        if (towerRoot == null) return false;
+
+        rendererScratch.Clear();
+        towerRoot.GetComponentsInChildren(false, rendererScratch);
+
+        bool any = false;
+        for (int i = 0; i < rendererScratch.Count; i++)
+        {
+            Renderer r = rendererScratch[i];
+            if (r == null) continue;
+            if (!r.enabled || !r.gameObject.activeInHierarchy) continue;
+            if (!any) { bounds = r.bounds; any = true; }
+            else bounds.Encapsulate(r.bounds);
+        }
+
+        return any;
+    }
+
+    private void ComputeColumnsFallback(out Vector3 position, out float orthoSize)
+    {
+        float aspect = cam != null ? Mathf.Max(0.1f, cam.aspect) : 1.777f;
+        float halfWidth = columns * 0.5f;
+        float sizeForWidth = halfWidth / aspect;
+        float topRow = Mathf.Max(1f, rowIndex);
+        float verticalSpan = topRow + 2f;
+        float sizeForHeight = verticalSpan * 0.5f;
+        orthoSize = Mathf.Max(sizeForWidth, sizeForHeight, cameraFitMinSize);
+        position = new Vector3((columns - 1) * 0.5f, (topRow - 1f) * 0.5f, -10f);
+    }
+
+    private void RestoreCameraDefaults()
+    {
+        if (!cameraCaptured || cam == null) return;
+        cam.orthographic = cameraStartOrthographic;
+        if (cameraStartOrthographic) cam.orthographicSize = cameraStartOrthographicSize;
+        cam.transform.SetPositionAndRotation(cameraStartPosition, cameraStartRotation);
+    }
+
+    private void FollowTowerWithCamera()
     {
         if (cam == null) return;
         float aspect = Mathf.Max(0.1f, cam.aspect);
@@ -295,28 +592,10 @@ public class StackGame : MonoBehaviour
         float targetY = (topRow - 1f) * 0.5f;
         Vector3 targetPos = new Vector3(targetX, Mathf.Max(0f, targetY), -10f);
 
-        if (instant)
-        {
-            cam.orthographicSize = targetSize;
-            cam.transform.position = targetPos;
-        }
-        else
-        {
-            float k = Time.deltaTime * cameraFollowSpeed;
-            cam.orthographicSize = Mathf.Lerp(cam.orthographicSize, targetSize, k);
-            cam.transform.position = Vector3.Lerp(cam.transform.position, targetPos, k);
-        }
+        float k = Time.deltaTime * cameraFollowSpeed;
+        cam.orthographicSize = Mathf.Lerp(cam.orthographicSize, targetSize, k);
+        cam.transform.position = Vector3.Lerp(cam.transform.position, targetPos, k);
     }
-
-    private void RestoreCameraDefaults()
-    {
-        if (!cameraCaptured || cam == null) return;
-        cam.orthographic = cameraStartOrthographic;
-        if (cameraStartOrthographic) cam.orthographicSize = cameraStartOrthographicSize;
-        cam.transform.SetPositionAndRotation(cameraStartPosition, cameraStartRotation);
-    }
-
-    private void FollowTowerWithCamera() => ApplyFraming(instant: false);
 
     private void PlaceMovingRow()
     {
@@ -352,21 +631,28 @@ public class StackGame : MonoBehaviour
         ScoreChanged?.Invoke(Score);
     }
 
+    /// <summary>
+    /// Detach a block so it can fall. Because the tower is being "held" by
+    /// the barber, we detach into world space but override the block's
+    /// effective gravity each frame (see UpdateDetachedPhysics) so it falls
+    /// along the tower's -Y instead of world -Y.
+    /// </summary>
     private void Drop(Transform block)
     {
         block.SetParent(null, true);
         Rigidbody body = block.gameObject.AddComponent<Rigidbody>();
-        body.AddTorque(UnityEngine.Random.insideUnitSphere * 2f, ForceMode.Impulse);
-        droppedBlocks.Add(block.gameObject);
+        body.useGravity = true; // Unity's built-in gravity is cancelled in UpdateDetachedPhysics
+        body.interpolation = RigidbodyInterpolation.Interpolate;
+        body.AddTorque(UnityEngine.Random.insideUnitSphere * 1.5f, ForceMode.Impulse);
+        detached.Add(new DetachedBlock { go = block.gameObject, body = body });
         Destroy(block.gameObject, 3f);
     }
 
-    /// <summary>Destroys only the blocks this game detached (not other scene Rigidbodies).</summary>
-    private void ClearDroppedBlocks()
+    private void ClearDetached()
     {
-        for (int i = 0; i < droppedBlocks.Count; i++)
-            if (droppedBlocks[i] != null) Destroy(droppedBlocks[i]);
-        droppedBlocks.Clear();
+        for (int i = 0; i < detached.Count; i++)
+            if (detached[i].go != null) Destroy(detached[i].go);
+        detached.Clear();
     }
 
     private void FinishGame()

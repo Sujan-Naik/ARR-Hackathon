@@ -623,7 +623,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 812353934}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 1cff7f19d88476f82aea8e5e3317e07a, type: 3}
   m_Name: 
@@ -731,7 +731,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 812353934}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 687f33ab8b7c0f2eb96d56d2a12724ea, type: 3}
   m_Name: 
@@ -766,24 +766,30 @@ MonoBehaviour:
   maxMissedFrames: 5
   registry: {fileID: 0}
   drawOverlay: 1
-  autoAdvance: 1
-  stepSeconds: 2.5
+  paused: 0
+  timeScale: 1
   parentEnabled: 1
   childFaceCentre: {x: 0.3, y: 0.35}
   barberFaceCentre: {x: 0.7, y: 0.35}
   parentFaceCentre: {x: 0.5, y: 0.75}
   faceSize: 0.18
-  childHandRestDrop: 0.14
-  childHandRaiseBy: 0.1
+  faceBobAmplitude: 0.008
+  faceBobSpeed: 0.7
+  childRollAmplitude: 18
+  childRollPeriod: 6
+  childHandDrop: 0.12
+  childHandSpread: 0.1
+  childRaiseHeight: 0.11
+  childRaiseInterval: 3
   childRaiseDuration: 0.2
-  childRaiseHoldSeconds: 0.6
-  parentHomeDrop: 0.12
-  parentRaiseBy: 0.14
-  parentRaiseDuration: 0.2
-  barberHomeDrop: 0.06
-  barberNearOffset: 0.02
-  barberFarOffset: 0.45
-  headRollSwing: 12
+  barberHandDrop: 0.1
+  barberHandSpread: 0.12
+  barberApproachDist: 0.14
+  barberCyclePeriod: 7
+  parentHandDrop: 0.12
+  parentHandSpread: 0.16
+  parentRaiseHeight: 0.16
+  parentCyclePeriod: 5
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0
@@ -1565,6 +1571,8 @@ MonoBehaviour:
   drawStatusPanel: 1
   panelWidth: 360
   panelPadding: 10
+  enableRoleMenu: 1
+  fallbackMenuKey: 109
   childColor: {r: 0.25, g: 0.75, b: 1, a: 1}
   barberColor: {r: 1, g: 0.6, b: 0.2, a: 1}
   parentColor: {r: 0.55, g: 1, b: 0.45, a: 1}

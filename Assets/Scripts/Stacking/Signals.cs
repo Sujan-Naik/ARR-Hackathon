@@ -59,15 +59,34 @@ namespace Stacking
         public readonly MonsterHand Right;
         public readonly bool HasAny;
 
+        /// <summary>
+        /// Optional: the barber's face centre, in the same normalized screen
+        /// space as <see cref="MonsterHand.Center"/>. Used by StackingDirector
+        /// to compute each hand's horizontal offset relative to the barber
+        /// (so a hand to the barber's own-left tilts the tower consistently
+        /// regardless of where the barber stands on screen). Null when the
+        /// barber face is not currently bound.
+        /// </summary>
+        public readonly Vector2? ReferenceFaceCentre;
+
         public MonsterHandsSignal(MonsterHand left, MonsterHand right, bool hasAny)
         {
             Left = left;
             Right = right;
             HasAny = hasAny;
+            ReferenceFaceCentre = null;
+        }
+
+        public MonsterHandsSignal(MonsterHand left, MonsterHand right, bool hasAny, Vector2? referenceFaceCentre)
+        {
+            Left = left;
+            Right = right;
+            HasAny = hasAny;
+            ReferenceFaceCentre = referenceFaceCentre;
         }
 
         public static readonly MonsterHandsSignal None =
-            new MonsterHandsSignal(MonsterHand.Unbound, MonsterHand.Unbound, false);
+            new MonsterHandsSignal(MonsterHand.Unbound, MonsterHand.Unbound, false, null);
     }
 
     /// <summary>

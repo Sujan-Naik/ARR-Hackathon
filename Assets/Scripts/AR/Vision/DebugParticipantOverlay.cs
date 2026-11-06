@@ -1,19 +1,8 @@
 ﻿using AR.Vision;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Text;
 using UnityEngine;
 
-/// <summary>
-/// Debug overlay for the salon demo. Shows, per participant role, where they
-/// are on screen, what they are doing, and whether the association is bound.
-///
-/// Read-only: this component never writes to the association, the stack game,
-/// or the hand controllers. It only reads the VisionPipeline's published
-/// Observations and the public APIs on ParticipantHandAssociation / StackGame.
-///
-/// Uses OnGUI on purpose. Gameplay code does not; a debug overlay does.
-/// </summary>
 [DefaultExecutionOrder(300)]
 public class DebugParticipantOverlay : MonoBehaviour
 {
@@ -24,26 +13,27 @@ public class DebugParticipantOverlay : MonoBehaviour
     [SerializeField] private BarberHandsController barberHands;
 
     [Header("Visibility")]
-    [Tooltip("Master switch. Off by default so the demo is clean; bind a key to toggle.")]
     [SerializeField] private bool showOverlay = true;
     [SerializeField] private KeyCode toggleKey = KeyCode.F1;
 
     [Header("Face boxes")]
     [SerializeField] private bool drawFaceBoxes = true;
     [SerializeField, Min(1f)] private float faceBoxThickness = 3f;
-    [Tooltip("Draw a thin box for every tracked face, not just role-bound ones.")]
-    [SerializeField] private bool drawAllFaces = false;
+    [SerializeField] private bool drawAllFaces = true;
 
     [Header("Hand markers")]
     [SerializeField] private bool drawHandMarkers = true;
     [SerializeField, Min(2f)] private float handMarkerRadius = 7f;
-    [Tooltip("Draw a dot for every tracked hand, including unassociated ones.")]
     [SerializeField] private bool drawUnassociatedHands = true;
 
     [Header("Panel")]
     [SerializeField] private bool drawStatusPanel = true;
     [SerializeField] private int panelWidth = 360;
     [SerializeField] private int panelPadding = 10;
+
+    [Header("Role menu")]
+    [SerializeField] private bool enableRoleMenu = true;
+    [SerializeField] private KeyCode fallbackMenuKey = KeyCode.M;
 
     [Header("Colours")]
     [SerializeField] private Color childColor = new Color(0.25f, 0.75f, 1f);
@@ -52,16 +42,24 @@ public class DebugParticipantOverlay : MonoBehaviour
     [SerializeField] private Color unboundColor = new Color(0.6f, 0.6f, 0.6f);
     [SerializeField] private Color warnColor = new Color(1f, 0.78f, 0.12f);
 
-    // Scratch buffers so we don't allocate per frame.
     private readonly List<Observation> scratchHands = new List<Observation>();
     private readonly Dictionary<int, Observation> faceById = new Dictionary<int, Observation>();
     private readonly Dictionary<int, Observation> handById = new Dictionary<int, Observation>();
+    private readonly List<Rect> faceScreenRects = new List<Rect>();
 
     private Texture2D white;
     private GUIStyle labelStyle;
     private GUIStyle headerStyle;
     private GUIStyle panelStyle;
+    private GUIStyle menuItemStyle;
+    private GUIStyle menuHeaderStyle;
     private int frameCounter;
+
+    // Menu state: active face (TrackId), target screen rect, hit test rects.
+    private int activeFaceId = -1;
+    private Rect activeFaceScreenRect;
+    private readonly List<KeyValuePair<Rect, ParticipantHandAssociation.ParticipantRole?>> menuHitRects =
+        new List<KeyValuePair<Rect, ParticipantHandAssociation.ParticipantRole?>>();
 
     private static readonly ParticipantHandAssociation.ParticipantRole[] Roles =
     {
@@ -72,7 +70,7 @@ public class DebugParticipantOverlay : MonoBehaviour
 
     private void Awake()
     {
-        if (vision == null) vision = FindObjectOfType<VisionPipeline>();
+        if (vision == null) vision = FindObjectOfType<VisionStub>() ?? FindObjectOfType<VisionPipeline>();
         if (association == null) association = FindObjectOfType<ParticipantHandAssociation>();
         if (stackGame == null) stackGame = FindObjectOfType<StackGame>();
         if (barberHands == null) barberHands = FindObjectOfType<BarberHandsController>();
@@ -98,7 +96,6 @@ public class DebugParticipantOverlay : MonoBehaviour
         RebuildIndexes();
     }
 
-    /// <summary>Rebuilds the per-frame lookups from the pipeline's published list.</summary>
     private void RebuildIndexes()
     {
         faceById.Clear();
@@ -125,8 +122,6 @@ public class DebugParticipantOverlay : MonoBehaviour
 
         EnsureStyles();
 
-        // The camera preview RawImage is a full-screen Canvas child. Its world
-        // corners give us the pixel rect to map normalized face/hand coords into.
         Rect preview = GetPreviewScreenRect();
 
         if (drawFaceBoxes)
@@ -137,6 +132,9 @@ public class DebugParticipantOverlay : MonoBehaviour
 
         if (drawStatusPanel)
             DrawStatusPanel(preview);
+
+        if (enableRoleMenu)
+            HandleRoleMenu(preview);
     }
 
     private void EnsureStyles()
@@ -159,13 +157,22 @@ public class DebugParticipantOverlay : MonoBehaviour
         };
 
         panelStyle = new GUIStyle(GUI.skin.box);
+
+        menuHeaderStyle = new GUIStyle(labelStyle)
+        {
+            fontSize = 12,
+            alignment = TextAnchor.MiddleLeft,
+        };
+
+        menuItemStyle = new GUIStyle(GUI.skin.label)
+        {
+            fontSize = 12,
+            alignment = TextAnchor.MiddleLeft,
+            padding = new RectOffset(6, 6, 2, 2),
+        };
+        menuItemStyle.normal.textColor = Color.white;
     }
 
-    /// <summary>
-    /// Returns the screen-pixel rect of the webcam preview. Falls back to the
-    /// whole screen if the VisionPipeline's RectTransform can't be found.
-    /// Assumes a Screen Space - Overlay canvas (same assumption VisionPipeline makes).
-    /// </summary>
     private Rect GetPreviewScreenRect()
     {
         if (vision == null) return new Rect(0f, 0f, Screen.width, Screen.height);
@@ -174,12 +181,16 @@ public class DebugParticipantOverlay : MonoBehaviour
         if (rt == null) return new Rect(0f, 0f, Screen.width, Screen.height);
 
         Vector3[] corners = new Vector3[4];
-        rt.GetWorldCorners(corners); // BL, TL, TR, BR in screen pixels
+        rt.GetWorldCorners(corners);
 
         float x = corners[0].x;
-        float y = Screen.height - corners[2].y; // GUI y is top-down
+        float y = Screen.height - corners[2].y;
         float w = corners[2].x - corners[0].x;
         float h = corners[2].y - corners[0].y;
+
+        if (w <= 1f || h <= 1f)
+            return new Rect(0f, 0f, Screen.width, Screen.height);
+
         return new Rect(x, y, w, h);
     }
 
@@ -189,34 +200,37 @@ public class DebugParticipantOverlay : MonoBehaviour
 
     private void DrawFaces(Rect preview)
     {
-        if (association != null && association.RolesAssigned)
+        faceScreenRects.Clear();
+
+        // 1) Role-bound faces (draw first so they sit under the unbound boxes if overlapping).
+        if (association != null)
         {
             for (int r = 0; r < Roles.Length; r++)
             {
                 ParticipantHandAssociation.ParticipantRole role = Roles[r];
-                Color color = RoleColor(role);
+                if (!association.TryGetFace(role, out Observation face)) continue;
 
-                if (association.TryGetFace(role, out Observation face))
-                {
-                    Rect box = NormalizedToScreen(face.NormalizedRect, preview);
-                    DrawRectOutline(box, color, faceBoxThickness);
-                    DrawLabel(
-                        new Vector2(box.x, box.y - 18f),
-                        role.ToString().ToUpperInvariant()
-                            + "  conf " + face.Confidence.ToString("0.00")
-                            + (face.IsIdentified ? "  id:" + face.Label : ""),
-                        color);
-                }
+                Rect box = NormalizedToScreen(face.NormalizedRect, preview);
+                faceScreenRects.Add(box);
+
+                Color color = RoleColor(role);
+                DrawRectOutline(box, color, faceBoxThickness);
+                DrawLabel(
+                    new Vector2(box.x, box.y - 18f),
+                    role.ToString().ToUpperInvariant()
+                        + "  conf " + face.Confidence.ToString("0.00")
+                        + "  right-click to change",
+                    color);
             }
         }
 
-        if (drawAllFaces && vision != null)
+        // 2) Every other tracked face, in grey, so the operator can right-click it too.
+        if (drawAllFaces)
         {
             foreach (var pair in faceById)
             {
                 Observation face = pair.Value;
 
-                // Skip faces already drawn above.
                 bool alreadyDrawn = false;
                 for (int r = 0; r < Roles.Length; r++)
                 {
@@ -231,15 +245,18 @@ public class DebugParticipantOverlay : MonoBehaviour
                 if (alreadyDrawn) continue;
 
                 Rect box = NormalizedToScreen(face.NormalizedRect, preview);
+                faceScreenRects.Add(box);
+
                 DrawRectOutline(box, unboundColor, 1f);
                 DrawLabel(new Vector2(box.x, box.y - 16f),
-                    "face " + face.TrackId, unboundColor);
+                    "face " + face.TrackId + "  right-click to assign",
+                    unboundColor);
             }
         }
     }
 
     // ------------------------------------------------------------------
-    // Hand drawing
+    // Hand drawing (unchanged behaviour)
     // ------------------------------------------------------------------
 
     private void DrawHands(Rect preview)
@@ -268,10 +285,9 @@ public class DebugParticipantOverlay : MonoBehaviour
                 Vector2 screen = NormalizedToScreenPoint(hand.Center, preview);
                 DrawCircle(screen, handMarkerRadius, color);
 
-                string state = HandState(hand);
                 DrawLabel(
                     new Vector2(screen.x + handMarkerRadius + 4f, screen.y - 8f),
-                    role + " hand  " + state,
+                    role + " hand  " + HandState(hand),
                     color);
             }
         }
@@ -313,7 +329,199 @@ public class DebugParticipantOverlay : MonoBehaviour
     }
 
     // ------------------------------------------------------------------
-    // Status panel
+    // Right-click role menu
+    // ------------------------------------------------------------------
+
+    private void HandleRoleMenu(Rect preview)
+    {
+        Event e = Event.current;
+        if (e == null) return;
+
+        // Open the menu on right-click over a face box.
+        if (e.type == EventType.MouseDown && e.button == 1)
+        {
+            for (int i = 0; i < faceScreenRects.Count; i++)
+            {
+                if (faceScreenRects[i].Contains(e.mousePosition))
+                {
+                    // Match by rect back to a face TrackId.
+                    int trackId = -1;
+                    foreach (var pair in faceById)
+                    {
+                        Rect box = NormalizedToScreen(pair.Value.NormalizedRect, preview);
+                        if (box.Contains(e.mousePosition)) { trackId = pair.Key; break; }
+                    }
+                    if (trackId >= 0)
+                    {
+                        activeFaceId = trackId;
+                        activeFaceScreenRect = faceScreenRects[i];
+                        BuildMenuHitRects();
+                        e.Use();
+                        return;
+                    }
+                }
+            }
+            // Click outside: close menu.
+            activeFaceId = -1;
+            menuHitRects.Clear();
+        }
+
+        // Fallback key: opens menu on the first tracked face (useful if right-click is captured elsewhere).
+        if (Input.GetKeyDown(fallbackMenuKey) && activeFaceId < 0 && faceById.Count > 0)
+        {
+            foreach (var pair in faceById) { activeFaceId = pair.Key; break; }
+            Rect box = NormalizedToScreen(faceById[activeFaceId].NormalizedRect, preview);
+            activeFaceScreenRect = box;
+            BuildMenuHitRects();
+        }
+
+        if (activeFaceId < 0) return;
+
+        // Draw the menu.
+        DrawRoleMenu();
+
+        // Handle clicks inside the menu.
+        if (e.type == EventType.MouseDown && e.button == 0)
+        {
+            for (int i = 0; i < menuHitRects.Count; i++)
+            {
+                if (!menuHitRects[i].Key.Contains(e.mousePosition)) continue;
+
+                ParticipantHandAssociation.ParticipantRole? chosen = menuHitRects[i].Value;
+                ApplyMenuChoice(chosen);
+                activeFaceId = -1;
+                menuHitRects.Clear();
+                e.Use();
+                return;
+            }
+        }
+
+        // Escape closes the menu.
+        if (e.type == EventType.KeyDown && e.keyCode == KeyCode.Escape)
+        {
+            activeFaceId = -1;
+            menuHitRects.Clear();
+            e.Use();
+        }
+    }
+
+    private void BuildMenuHitRects()
+    {
+        menuHitRects.Clear();
+
+        float width = 200f;
+        float lineHeight = 22f;
+        float pad = 6f;
+        float headerHeight = 22f;
+
+        // Anchor below the face box, clamped to screen.
+        float x = Mathf.Clamp(activeFaceScreenRect.x,
+                              0f, Screen.width - width);
+        float y = activeFaceScreenRect.yMax + 4f;
+        if (y + headerHeight + lineHeight * 4f > Screen.height)
+            y = Mathf.Max(0f, activeFaceScreenRect.y - (headerHeight + lineHeight * 4f) - 4f);
+
+        float cy = y + headerHeight;
+
+        // "Clear" entry
+        menuHitRects.Add(new KeyValuePair<Rect, ParticipantHandAssociation.ParticipantRole?>(
+            new Rect(x + pad, cy + pad, width - pad * 2f, lineHeight),
+            null));
+        cy += lineHeight;
+
+        for (int i = 0; i < Roles.Length; i++)
+        {
+            menuHitRects.Add(new KeyValuePair<Rect, ParticipantHandAssociation.ParticipantRole?>(
+                new Rect(x + pad, cy + pad, width - pad * 2f, lineHeight),
+                Roles[i]));
+            cy += lineHeight;
+        }
+    }
+
+    private void DrawRoleMenu()
+    {
+        if (activeFaceId < 0) return;
+
+        float width = 200f;
+        float lineHeight = 22f;
+        float pad = 6f;
+        float headerHeight = 22f;
+
+        Rect header = new Rect(
+            menuHitRects[0].Key.x - pad,
+            menuHitRects[0].Key.y - pad - headerHeight,
+            width,
+            headerHeight + lineHeight * menuHitRects.Count + pad * 2f);
+
+        Color prev = GUI.color;
+        GUI.color = new Color(0f, 0f, 0f, 0.88f);
+        GUI.DrawTexture(header, white);
+        GUI.color = prev;
+
+        Color prevText = menuHeaderStyle.normal.textColor;
+        menuHeaderStyle.normal.textColor = Color.white;
+        GUI.Label(new Rect(header.x + 6f, header.y + 2f, header.width - 12f, headerHeight),
+            "face " + activeFaceId + " -> assign role", menuHeaderStyle);
+        menuHeaderStyle.normal.textColor = prevText;
+
+        for (int i = 0; i < menuHitRects.Count; i++)
+        {
+            Rect r = menuHitRects[i].Key;
+            ParticipantHandAssociation.ParticipantRole? role = menuHitRects[i].Value;
+
+            bool hover = r.Contains(Event.current.mousePosition);
+            if (hover)
+            {
+                prev = GUI.color;
+                GUI.color = new Color(1f, 1f, 1f, 0.12f);
+                GUI.DrawTexture(r, white);
+                GUI.color = prev;
+            }
+
+            string text;
+            if (role.HasValue)
+            {
+                // Mark current binding.
+                bool current = association != null
+                    && association.TryGetFace(role.Value, out Observation f)
+                    && f.TrackId == activeFaceId;
+                text = (current ? "\u2713 " : "   ") + role.Value.ToString();
+                menuItemStyle.normal.textColor = RoleColor(role.Value);
+            }
+            else
+            {
+                text = "   Clear manual binding";
+                menuItemStyle.normal.textColor = unboundColor;
+            }
+
+            GUI.Label(r, text, menuItemStyle);
+        }
+    }
+
+    private void ApplyMenuChoice(ParticipantHandAssociation.ParticipantRole? chosen)
+    {
+        if (association == null) return;
+
+        if (!chosen.HasValue)
+        {
+            // Clear: unbind whichever role currently holds this face.
+            for (int i = 0; i < Roles.Length; i++)
+            {
+                if (association.TryGetFace(Roles[i], out Observation f)
+                    && f.TrackId == activeFaceId)
+                {
+                    association.AssignRole(Roles[i], -1);
+                    break;
+                }
+            }
+            return;
+        }
+
+        association.AssignRole(chosen.Value, activeFaceId);
+    }
+
+    // ------------------------------------------------------------------
+    // Status panel (unchanged)
     // ------------------------------------------------------------------
 
     private void DrawStatusPanel(Rect preview)
@@ -334,14 +542,12 @@ public class DebugParticipantOverlay : MonoBehaviour
 
         DrawLine(ref y, x, "PARTICIPANT DEBUG  (F1 to hide)", lineHeight, headerStyle, Color.white);
 
-        // Pipeline readiness.
         bool ready = vision != null && vision.IsReady();
         DrawLine(ref y, x,
             "vision: " + (ready ? "ready" : "NOT READY")
             + "   frames observed: " + frameCounter,
             lineHeight, labelStyle, ready ? Color.white : warnColor);
 
-        // Role assignment.
         bool rolesAssigned = association != null && association.RolesAssigned;
         DrawLine(ref y, x,
             "roles assigned: " + (rolesAssigned ? "YES" : "no (need 2 faces: Child+Barber)"),
@@ -354,7 +560,6 @@ public class DebugParticipantOverlay : MonoBehaviour
 
         y += 4f;
 
-        // Per-role block.
         for (int r = 0; r < Roles.Length; r++)
         {
             ParticipantHandAssociation.ParticipantRole role = Roles[r];
@@ -363,7 +568,6 @@ public class DebugParticipantOverlay : MonoBehaviour
             DrawLine(ref y, x, "--- " + role.ToString().ToUpperInvariant() + " ---",
                 lineHeight, labelStyle, color);
 
-            // Face.
             if (association != null && association.TryGetFace(role, out Observation face))
             {
                 DrawLine(ref y, x,
@@ -378,7 +582,6 @@ public class DebugParticipantOverlay : MonoBehaviour
                 DrawLine(ref y, x, "  face: NONE", lineHeight, labelStyle, unboundColor);
             }
 
-            // Hands.
             scratchHands.Clear();
             if (association != null)
                 association.GetHandsForRole(role, scratchHands);
@@ -401,12 +604,10 @@ public class DebugParticipantOverlay : MonoBehaviour
                 }
             }
 
-            // Per-role status line.
             DrawLine(ref y, x, "  status: " + RoleStatus(role), lineHeight, labelStyle, color);
             y += 4f;
         }
 
-        // Tower / game state.
         y += 2f;
         DrawLine(ref y, x, "--- STACK GAME ---", lineHeight, labelStyle, Color.white);
 
@@ -534,7 +735,6 @@ public class DebugParticipantOverlay : MonoBehaviour
         Color prev = GUI.color;
         GUI.color = color;
 
-        // Draw a crosshair plus a filled square; simple and crisp.
         GUI.DrawTexture(new Rect(centre.x - radius, centre.y - 1f, radius * 2f, 2f), white);
         GUI.DrawTexture(new Rect(centre.x - 1f, centre.y - radius, 2f, radius * 2f), white);
 

@@ -9,12 +9,12 @@ namespace Stacking
     /// Adapter: barber's hands -> MonsterHandsSignal.
     /// Left/right separated by centre.x. If only one hand is tracked it fills
     /// the left slot; the right slot is Unbound (TrackId -1).
+    /// Also exposes the barber's face centre (if bound) so the director can
+    /// compute hand offsets relative to the barber, not the child.
     /// </summary>
     public class BarberHandsInput : MonoBehaviour
     {
         [SerializeField] private ParticipantHandAssociation association;
-
-        [Header("Tuning")]
         [SerializeField] private bool requireFace = true;
 
         public MonsterHandsSignal Current { get; private set; } = MonsterHandsSignal.None;
@@ -42,8 +42,15 @@ namespace Stacking
             if (association == null || !association.RolesAssigned)
                 return MonsterHandsSignal.None;
 
-            if (requireFace && !association.TryGetFace(
-                    ParticipantHandAssociation.ParticipantRole.Barber, out _))
+            Vector2? barberFaceCentre = null;
+            if (association.TryGetFace(
+                    ParticipantHandAssociation.ParticipantRole.Barber,
+                    out Observation barberFace))
+            {
+                barberFaceCentre = barberFace.Center;
+            }
+
+            if (requireFace && barberFaceCentre == null)
                 return MonsterHandsSignal.None;
 
             association.GetHandsForRole(
@@ -65,7 +72,7 @@ namespace Stacking
             MonsterHand leftHand = ToHand(leftObs);
             MonsterHand rightHand = hasRight ? ToHand(rightObs) : MonsterHand.Unbound;
 
-            return new MonsterHandsSignal(leftHand, rightHand, true);
+            return new MonsterHandsSignal(leftHand, rightHand, true, barberFaceCentre);
         }
 
         private static MonsterHand ToHand(Observation o)
@@ -87,7 +94,15 @@ namespace Stacking
                 && Vector2.Distance(a.Left.Center, b.Left.Center) < 0.001f
                 && Vector2.Distance(a.Right.Center, b.Right.Center) < 0.001f
                 && a.Left.IsClosed == b.Left.IsClosed
-                && a.Right.IsClosed == b.Right.IsClosed;
+                && a.Right.IsClosed == b.Right.IsClosed
+                && NullableVector2ApproximatelyEqual(a.ReferenceFaceCentre, b.ReferenceFaceCentre);
+        }
+
+        private static bool NullableVector2ApproximatelyEqual(Vector2? a, Vector2? b)
+        {
+            if (a.HasValue != b.HasValue) return false;
+            if (!a.HasValue) return true;
+            return Vector2.Distance(a.Value, b.Value) < 0.001f;
         }
     }
 }

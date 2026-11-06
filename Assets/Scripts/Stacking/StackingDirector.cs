@@ -19,14 +19,7 @@ namespace Stacking
         [SerializeField] private TiltMatchView matchView;
 
         [Header("Round gating")]
-        [Tooltip("If false, the director will NOT auto-spawn the first block. Call BeginRound() to arm it. " +
-                 "Leave this ON for standalone testing of the scene without KidsSalonGameFlow; " +
-                 "KidsSalonGameFlow turns it on automatically when a round starts.")]
         [SerializeField] private bool armed = false;
-
-        [Tooltip("If the game reports not moving for this long AFTER a round is armed and a block " +
-                 "has already been spawned and destroyed, spawn a replacement. Prevents the " +
-                 "double-spawn you got when RestartGame briefly reports IsMoving == false.")]
         [SerializeField, Min(0f)] private float respawnGraceSeconds = 0.15f;
 
         [Header("Guiding detection")]
@@ -39,12 +32,34 @@ namespace Stacking
         [Header("Match")]
         [SerializeField, Range(1f, 30f)] private float matchToleranceDegrees = 8f;
 
+        [Header("Barber hand tilt")]
+        [Tooltip("When the barber's hands are visible, they rotate the tower " +
+                 "based on their horizontal offset from the barber's face. " +
+                 "When hands are not visible, the tower springs back to upright.")]
+        [SerializeField] private bool barberHandsTiltTower = true;
+
+        [Tooltip("Peak tower roll (degrees) when a barber hand is fully " +
+                 "offset to one side of the barber's face.")]
+        [SerializeField, Range(0f, 90f)] private float barberTiltMaxDegrees = 35f;
+
+        [Tooltip("Normalized horizontal offset (from the barber's face centre) " +
+                 "that maps to the full barberTiltMaxDegrees. Larger = less " +
+                 "sensitive.")]
+        [SerializeField, Range(0.02f, 0.5f)] private float barberTiltFullOffset = 0.15f;
+
+        [Tooltip("When true, uses the average of both barber hands' offsets. " +
+                 "When false, uses whichever hand is further from the face " +
+                 "centre.")]
+        [SerializeField] private bool barberTiltUseAverage = true;
+
         public Phase CurrentPhase { get; private set; } = Phase.WaitingForChild;
         public HeadTiltSignal Head { get; private set; } = HeadTiltSignal.None;
         public MonsterHandsSignal Monster { get; private set; } = MonsterHandsSignal.None;
         public CraneSignal Crane { get; private set; } = CraneSignal.None;
 
         public bool BarberGuiding { get; private set; }
+        public bool BarberHandsVisible { get; private set; }
+        public float BarberTiltTarget { get; private set; }
         public float HeldTilt { get; private set; }
         public float CurrentTilt { get; private set; }
         public TiltMatch Match { get; private set; } = TiltMatch.Unknown;
@@ -52,7 +67,6 @@ namespace Stacking
 
         public bool ParentPresent => Crane.HasHand;
         public CraneSignal.Hand ParentRaisingHand => Crane.RaisingHand;
-
         public bool IsArmed => armed;
 
         public event Action<Phase> PhaseChanged;
@@ -83,11 +97,6 @@ namespace Stacking
             if (childHands != null) childHands.Placed -= OnChildPlaced;
         }
 
-        /// <summary>
-        /// Called by KidsSalonGameFlow (or any host) when a round officially starts.
-        /// From that moment the director will keep a block moving. Before that it
-        /// will do nothing, so no stray blocks appear before the game begins.
-        /// </summary>
         public void BeginRound()
         {
             armed = true;
@@ -95,10 +104,6 @@ namespace Stacking
             _notMovingSince = -1f;
         }
 
-        /// <summary>
-        /// Called when a round ends or is torn down. Clears the armed flag so the
-        /// next scene / next round starts clean.
-        /// </summary>
         public void EndRound()
         {
             armed = false;
@@ -112,6 +117,7 @@ namespace Stacking
 
             EnsureFirstBlockSpawned();
             UpdateGuidingState();
+            UpdateBarberTilt();
             UpdateTiltAndMatch();
             ApplyTiltToTower();
 
@@ -131,8 +137,6 @@ namespace Stacking
                 return;
             }
 
-            // Not moving. If we've never spawned, spawn immediately (this is
-            // the normal "first block" path).
             if (!_firstSpawnDone)
             {
                 stackGame.SpawnBlock();
@@ -141,10 +145,6 @@ namespace Stacking
                 return;
             }
 
-            // We've spawned before, and the game briefly reports not moving
-            // (e.g. right after RestartGame, or during block settle). Wait a
-            // grace period before spawning another, so we don't spawn a
-            // duplicate during reset.
             if (_notMovingSince < 0f)
                 _notMovingSince = Time.unscaledTime;
 
@@ -167,16 +167,87 @@ namespace Stacking
             BarberGuiding = nearest <= threshold;
         }
 
+        /// <summary>
+        /// Whenever the barber's hands are visible, compute a target roll
+        /// from their horizontal offset relative to the barber's face centre
+        /// (and the child's head centre if available). Hands to the left of
+        /// the face tilt the tower one way, hands to the right the other.
+        /// When no hands are visible, the target is upright (0 degrees).
+        /// </summary>
+        private void UpdateBarberTilt()
+        {
+            if (!barberHandsTiltTower) { BarberHandsVisible = false; BarberTiltTarget = 0f; return; }
+
+            if (!Monster.HasAny)
+            {
+                BarberHandsVisible = false;
+                BarberTiltTarget = 0f;
+                return;
+            }
+
+            BarberHandsVisible = true;
+
+            // Reference: the barber's face centre if we have it, otherwise
+            // the child's head centre, otherwise screen centre.
+            Vector2 reference;
+            if (Monster.ReferenceFaceCentre.HasValue)
+                reference = Monster.ReferenceFaceCentre.Value;
+            else if (Head.HasFace)
+                reference = Head.Center;
+            else
+                reference = new Vector2(0.5f, 0.5f);
+
+            float offsetSum = 0f;
+            int offsetCount = 0;
+            float maxAbsOffset = 0f;
+
+            if (Monster.Left.IsBound)
+            {
+                float dx = Monster.Left.Center.x - reference.x;
+                offsetSum += dx;
+                offsetCount++;
+                if (Mathf.Abs(dx) > maxAbsOffset) maxAbsOffset = Mathf.Abs(dx);
+            }
+            if (Monster.Right.IsBound)
+            {
+                float dx = Monster.Right.Center.x - reference.x;
+                offsetSum += dx;
+                offsetCount++;
+                if (Mathf.Abs(dx) > maxAbsOffset) maxAbsOffset = Mathf.Abs(dx);
+            }
+
+            if (offsetCount == 0) { BarberTiltTarget = 0f; return; }
+
+            float offset = barberTiltUseAverage
+                ? offsetSum / offsetCount
+                : Mathf.Sign(offsetSum) * maxAbsOffset;
+
+            float full = Mathf.Max(0.02f, barberTiltFullOffset);
+            float normalized = Mathf.Clamp(offset / full, -1f, 1f);
+
+            // Convention: hand to screen-RIGHT of the barber face => tower
+            // tilts clockwise (negative Z in Unity) so it visually "leans
+            // away" from the hand. Flip the sign if you want the opposite.
+            BarberTiltTarget = -normalized * barberTiltMaxDegrees;
+        }
+
         private void UpdateTiltAndMatch()
         {
-            if (BarberGuiding)
+            // Barber hands visible: they own the tilt. The child's head roll
+            // no longer holds the pose in this mode.
+            if (BarberHandsVisible)
             {
-                HeldTilt = Head.HasFace ? Head.RollDegrees : 0f;
+                HeldTilt = BarberTiltTarget;
                 Match = TiltMatch.Unknown;
                 MatchError01 = 0f;
             }
             else
             {
+                // No barber hands: spring back to upright. (Child head roll
+                // no longer sets HeldTilt; that was the previous behaviour
+                // where the child held the pose after the barber released.)
+                HeldTilt = 0f;
+
                 if (!Head.HasFace) { Match = TiltMatch.Unknown; MatchError01 = 0f; }
                 else
                 {
@@ -185,6 +256,7 @@ namespace Stacking
                     Match = error <= matchToleranceDegrees ? TiltMatch.Matched : TiltMatch.Mismatched;
                 }
             }
+
             CurrentTilt = Mathf.Lerp(CurrentTilt, HeldTilt, Time.deltaTime * tiltLerpSpeed);
         }
 
