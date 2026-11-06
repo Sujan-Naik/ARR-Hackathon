@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.UI;
@@ -28,6 +29,10 @@ public class StackGame : MonoBehaviour
     [SerializeField] public Camera cam;
     [SerializeField, Min(0f)] public float cameraFollowSpeed = 3f;
 
+    [Header("Startup")]
+    [Tooltip("If true and no KidsSalonGameFlow exists in the scene, the game starts itself on scene load. Leave OFF so nothing is built until RestartGame() is called.")]
+    [SerializeField] private bool autoStartIfNoFlow = false;
+
     [Header("Vision steering")]
     [SerializeField] private bool steerByExternalInput = false;
     [SerializeField, Min(0.1f)] private float steerLerpSpeed = 12f;
@@ -43,9 +48,10 @@ public class StackGame : MonoBehaviour
     [SerializeField] private Button slowButton;
     [SerializeField] private Button restartButton;
 
-    public int Score => rowIndex - 1;
+    public int Score => Mathf.Max(0, rowIndex - 1);
     public bool IsGameOver => gameOver;
     public bool IsMoving => movingRow != null;
+    public bool HasStarted => gameStarted;
     public Transform TowerRoot => towerRoot;
 
     public event Action<int> ScoreChanged;
@@ -64,9 +70,14 @@ public class StackGame : MonoBehaviour
     private bool slowed;
     private bool initialized;
     private bool buttonsBound;
+    private bool gameStarted;
 
     private bool hasSteerTarget;
     private float steerTargetPos;
+
+    // Blocks detached by Drop(). Tracked so a restart removes only these,
+    // never unrelated Rigidbodies elsewhere in the scene.
+    private readonly List<GameObject> droppedBlocks = new List<GameObject>();
 
     private Vector3 cameraStartPosition;
     private Quaternion cameraStartRotation;
@@ -83,16 +94,28 @@ public class StackGame : MonoBehaviour
 
     private void OnEnable()
     {
-        if (initialized) ConfigureCameraForGame();
+        // Only take over the camera if a game is actually running.
+        if (initialized && gameStarted) ConfigureCameraForGame();
     }
 
-    private void Start() { RestartGame(); }
+    private void Start()
+    {
+        // Scene load is inert: no rows are built here. The game begins only
+        // when RestartGame() is called (by KidsSalonGameFlow or the restart button).
+        EnsureInitialized();
+
+        if (autoStartIfNoFlow && FindObjectOfType<KidsSalonGameFlow>() == null)
+            RestartGame();
+        else
+            RefreshCanvasUI();
+    }
+
     private void OnDisable() { RestoreCameraDefaults(); }
     private void OnDestroy() { UnbindButtons(); }
 
     private void Update()
     {
-        if (PauseOverlay.IsPaused || !initialized) return;
+        if (PauseOverlay.IsPaused || !initialized || !gameStarted) return;
         if (gameOver) { RefreshCanvasUI(); return; }
 
         if (Input.GetKeyDown(slowKey)) ToggleSlow();
@@ -123,6 +146,7 @@ public class StackGame : MonoBehaviour
         RefreshCanvasUI();
     }
 
+    /// <summary>Starts (or restarts) the game. This is the only place Row 0 is built.</summary>
     public void RestartGame()
     {
         EnsureInitialized();
@@ -130,6 +154,9 @@ public class StackGame : MonoBehaviour
         if (towerRoot != null) Destroy(towerRoot.gameObject);
         towerRoot = new GameObject("Stack Tower").transform;
 
+        ClearDroppedBlocks();
+
+        gameStarted = true;
         movingRow = null;
         rowIndex = 1;
         prevWidth = Mathf.Clamp(startWidth, 1, Mathf.Max(1, columns));
@@ -153,7 +180,7 @@ public class StackGame : MonoBehaviour
     public void SpawnBlock()
     {
         EnsureInitialized();
-        if (PauseOverlay.IsPaused || gameOver || movingRow != null) return;
+        if (!gameStarted || PauseOverlay.IsPaused || gameOver || movingRow != null) return;
         pos = 0f;
         dir = 1f;
         hasSteerTarget = false;
@@ -164,16 +191,23 @@ public class StackGame : MonoBehaviour
 
     public void SteerMovingBlock(float normalizedX)
     {
-        if (movingRow == null || gameOver) return;
+        if (!gameStarted || movingRow == null || gameOver) return;
         steerByExternalInput = true;
         float max = columns - width;
         steerTargetPos = Mathf.Clamp01(normalizedX) * max;
         hasSteerTarget = true;
     }
 
+    /// <summary>Hands control back to the built-in sweep.</summary>
+    public void ReleaseSteering()
+    {
+        steerByExternalInput = false;
+        hasSteerTarget = false;
+    }
+
     public void NudgeMovingBlock(int direction)
     {
-        if (movingRow == null || gameOver) return;
+        if (!gameStarted || movingRow == null || gameOver) return;
         steerByExternalInput = true;
         float max = columns - width;
         float basePos = hasSteerTarget ? steerTargetPos : pos;
@@ -183,14 +217,14 @@ public class StackGame : MonoBehaviour
 
     public void StopBlock()
     {
-        if (PauseOverlay.IsPaused || !initialized || gameOver || movingRow == null) return;
+        if (!gameStarted || PauseOverlay.IsPaused || !initialized || gameOver || movingRow == null) return;
         PlaceMovingRow();
         RefreshCanvasUI();
     }
 
     public void ToggleSlow()
     {
-        if (PauseOverlay.IsPaused || !initialized || gameOver) return;
+        if (!gameStarted || PauseOverlay.IsPaused || !initialized || gameOver) return;
         slowed = !slowed;
         RefreshCanvasUI();
     }
@@ -323,7 +357,16 @@ public class StackGame : MonoBehaviour
         block.SetParent(null, true);
         Rigidbody body = block.gameObject.AddComponent<Rigidbody>();
         body.AddTorque(UnityEngine.Random.insideUnitSphere * 2f, ForceMode.Impulse);
+        droppedBlocks.Add(block.gameObject);
         Destroy(block.gameObject, 3f);
+    }
+
+    /// <summary>Destroys only the blocks this game detached (not other scene Rigidbodies).</summary>
+    private void ClearDroppedBlocks()
+    {
+        for (int i = 0; i < droppedBlocks.Count; i++)
+            if (droppedBlocks[i] != null) Destroy(droppedBlocks[i]);
+        droppedBlocks.Clear();
     }
 
     private void FinishGame()
@@ -389,14 +432,15 @@ public class StackGame : MonoBehaviour
 
         if (instructionText != null)
         {
-            if (gameOver) instructionText.text = "Round over! Try again or return to the salon.";
+            if (!gameStarted) instructionText.text = "";
+            else if (gameOver) instructionText.text = "Round over! Try again or return to the salon.";
             else if (movingRow == null) instructionText.text = "Raise a hand to send the next block";
             else instructionText.text = "Parent: raise to steer \u2022 Child: raise to place";
         }
 
         if (gameOverText != null) gameOverText.text = "Tower score: " + Score + "\nGreat stacking!";
-        if (spawnButton != null) spawnButton.interactable = !gameOver && movingRow == null;
-        if (stopButton != null) stopButton.interactable = !gameOver && movingRow != null;
-        if (slowButton != null) slowButton.interactable = !gameOver;
+        if (spawnButton != null) spawnButton.interactable = gameStarted && !gameOver && movingRow == null;
+        if (stopButton != null) stopButton.interactable = gameStarted && !gameOver && movingRow != null;
+        if (slowButton != null) slowButton.interactable = gameStarted && !gameOver;
     }
 }

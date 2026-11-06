@@ -133,11 +133,28 @@ namespace AR.Vision
 
         void BuildModules()
         {
+            Debug.Log($"[VisionPipeline] BuildModules: enableFaces={enableFaces} " +
+                      $"detectorAsset={(models.face.detector != null ? "set" : "NULL")} " +
+                      $"embedderAsset={(models.face.embedder != null ? "set" : "NULL")}");
+
             if (enableFaces)
             {
-                faceModule = new FaceModule(models.face);
-                faceTracker = AddSlot(faceModule);
+                try
+                {
+                    faceModule = new FaceModule(models.face);
+                    faceTracker = AddSlot(faceModule);
+                    Debug.Log($"[VisionPipeline] FaceModule constructed. IsReady={faceModule.IsReady}");
+                }
+                catch (System.Exception e)
+                {
+                    Debug.LogError($"[VisionPipeline] FaceModule construction FAILED: {e}");
+                }
             }
+            else
+            {
+                Debug.LogWarning("[VisionPipeline] enableFaces is FALSE — face detection disabled.");
+            }
+
             if (enableHands) AddSlot(new HandModule(models.hand));
             if (enableObjects) AddSlot(new ObjectModule(models.objects));
         }
@@ -207,6 +224,7 @@ namespace AR.Vision
             orientMat.SetFloat("_Angle", angle);
             orientMat.SetFloat("_FlipY", flip ? 1f : 0f);
 
+            display.texture = oriented;
             display.uvRect = new Rect(0f, 0f, 1f, 1f);
             display.rectTransform.localEulerAngles = Vector3.zero;
             fitter.aspectRatio = (float)w / h;

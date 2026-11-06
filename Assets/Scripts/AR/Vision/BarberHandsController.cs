@@ -251,6 +251,13 @@ public class BarberHandsController : MonoBehaviour
         if (!visible) HideAllHands();
     }
 
+    /// <summary>Recolours the barber line material. Useful to sync with a role HUD palette.</summary>
+    public void SetLineColor(Color color)
+    {
+        lineColor = color;
+        if (lineMaterial != null) lineMaterial.color = color;
+    }
+
     private void OnDisable() => HideAllHands();
 
     private void OnDestroy()

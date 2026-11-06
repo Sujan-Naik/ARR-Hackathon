@@ -17,6 +17,9 @@ namespace AR.Vision
     /// The panel only talks to ParticipantHandAssociation's public API:
     /// AssignRole, ClearManualRoles, IsRoleManual, GetFaceIdForRole,
     /// RolesAssigned. It reads VisionPipeline.Observations to enumerate faces.
+    ///
+    /// A short toast is shown for a couple of seconds after any binding
+    /// change so the operator gets confirmation even if the hint is hidden.
     /// </summary>
     [DefaultExecutionOrder(150)]
     public class RoleAssignmentPanel : MonoBehaviour
@@ -33,6 +36,10 @@ namespace AR.Vision
         [Header("Debug")]
         [SerializeField] private bool logActions = true;
 
+        [Header("Toast")]
+        [SerializeField, Min(0.5f)] private float toastSeconds = 2f;
+        [SerializeField] private Color toastColor = new Color(1f, 0.9f, 0.5f);
+
         private ParticipantHandAssociation.ParticipantRole targetRole =
             ParticipantHandAssociation.ParticipantRole.Child;
         private bool autoMode = true;
@@ -41,6 +48,9 @@ namespace AR.Vision
 
         private GUIStyle labelStyle;
         private GUIStyle hintStyle;
+
+        private string toastText;
+        private float toastUntil;
 
         // ------------------------------------------------------------------
         // Lifecycle
@@ -95,6 +105,7 @@ namespace AR.Vision
                 }
             }
 
+            ShowToast("mode: " + ModeLabel());
             if (logActions) Debug.Log("[Roles] mode: " + ModeLabel(), this);
         }
 
@@ -102,6 +113,7 @@ namespace AR.Vision
         {
             association.ClearManualRoles();
             autoMode = true;
+            ShowToast("manual bindings cleared");
             if (logActions) Debug.Log("[Roles] manual bindings cleared", this);
         }
 
@@ -119,6 +131,7 @@ namespace AR.Vision
 
             if (index < 0 || index >= sortedFaces.Count)
             {
+                ShowToast("no face #" + (index + 1));
                 if (logActions) Debug.Log("[Roles] no face #" + (index + 1), this);
                 return;
             }
@@ -126,6 +139,7 @@ namespace AR.Vision
             int faceId = sortedFaces[index].TrackId;
             association.AssignRole(targetRole, faceId);
 
+            ShowToast(targetRole + " <- face #" + faceId);
             if (logActions)
                 Debug.Log("[Roles] " + targetRole + " <- face " + faceId, this);
         }
@@ -133,6 +147,12 @@ namespace AR.Vision
         private string ModeLabel()
         {
             return autoMode ? "Auto" : targetRole.ToString();
+        }
+
+        private void ShowToast(string message)
+        {
+            toastText = message;
+            toastUntil = Time.time + toastSeconds;
         }
 
         // ------------------------------------------------------------------
@@ -160,7 +180,7 @@ namespace AR.Vision
 
         private void OnGUI()
         {
-            if (!showHint) return;
+            if (!showHint && Time.time >= toastUntil) return;
 
             EnsureStyles();
 
@@ -214,6 +234,16 @@ namespace AR.Vision
                     "   P#" + association.GetFaceIdForRole(
                         ParticipantHandAssociation.ParticipantRole.Parent);
                 GUI.Label(new Rect(x, y, width, lineHeight), line, labelStyle);
+            }
+
+            // Toast (always drawn, independent of the hint).
+            if (Time.time < toastUntil && !string.IsNullOrEmpty(toastText))
+            {
+                Color prevToast = GUI.color;
+                GUI.color = toastColor;
+                GUI.Label(new Rect(margin, Screen.height - 40f, 480f, 24f),
+                    "» " + toastText, labelStyle);
+                GUI.color = prevToast;
             }
         }
     }

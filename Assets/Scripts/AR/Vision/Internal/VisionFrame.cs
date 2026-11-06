@@ -1,4 +1,4 @@
-// Role: one captured frame as a CPU buffer in top-down order with a top-left origin.
+// Role: one captured frame as a GPUCompute buffer in top-down order with a top-left origin.
 // THE ONLY VERTICAL FLIP IN THE VISION LAYER happens in CopyFrom. Texture2D rows are bottom-up.
 using UnityEngine;
 

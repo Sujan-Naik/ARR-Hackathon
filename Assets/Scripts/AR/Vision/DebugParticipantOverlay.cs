@@ -344,7 +344,7 @@ public class DebugParticipantOverlay : MonoBehaviour
         // Role assignment.
         bool rolesAssigned = association != null && association.RolesAssigned;
         DrawLine(ref y, x,
-            "roles assigned: " + (rolesAssigned ? "YES" : "no (need 3 faces)"),
+            "roles assigned: " + (rolesAssigned ? "YES" : "no (need 2 faces: Child+Barber)"),
             lineHeight, labelStyle, rolesAssigned ? Color.white : warnColor);
 
         DrawLine(ref y, x,
@@ -419,6 +419,21 @@ public class DebugParticipantOverlay : MonoBehaviour
             DrawLine(ref y, x,
                 "  score: " + stackGame.Score,
                 lineHeight, labelStyle, Color.white);
+
+            var directorForHud = FindObjectOfType<Stacking.StackingDirector>();
+            DrawLine(ref y, x,
+                "  armed: " + (directorForHud != null && directorForHud.IsArmed ? "YES" : "no"),
+                lineHeight, labelStyle, Color.white);
+
+            var sweepForHud = FindObjectOfType<Stacking.BlockSweepController>();
+            if (sweepForHud != null)
+            {
+                DrawLine(ref y, x,
+                    "  steer hand: " + sweepForHud.SteerHand
+                    + "   target " + sweepForHud.SteerTarget.ToString("0.00")
+                    + "   sweeping " + (sweepForHud.IsSweeping ? "yes" : "no"),
+                    lineHeight, labelStyle, Color.white);
+            }
         }
         else
         {
@@ -468,7 +483,7 @@ public class DebugParticipantOverlay : MonoBehaviour
                 if (association == null
                     || !association.TryGetFace(role, out _))
                 {
-                    return "no face -> spawn disabled";
+                    return "optional -> auto-sweep";
                 }
                 if (stackGame == null) return "stackGame missing";
                 if (stackGame.IsGameOver) return "round over";

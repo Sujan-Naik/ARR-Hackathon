@@ -8,7 +8,7 @@ namespace Stacking
     public class ParentHandsInput : MonoBehaviour
     {
         [SerializeField] private ParticipantHandAssociation association;
-        [SerializeField, Range(0.01f, 0.3f)] private float raiseDistance = 0.09f;
+        [SerializeField, Range(0.001f, 0.3f)] private float raiseDistance = 0.005f;
         [SerializeField] private bool requiresOpenHand = true;
         [SerializeField, Min(0.1f)] private float raiseCooldown = 0.8f;
 
@@ -19,6 +19,7 @@ namespace Stacking
         private readonly Dictionary<int, Vector2> previous = new Dictionary<int, Vector2>();
         private readonly HashSet<int> active = new HashSet<int>();
         private float lastRaiseTime = -100f;
+        private CraneSignal.Hand lastHeldHand = CraneSignal.Hand.None;
 
         private void Awake()
         {
@@ -34,10 +35,10 @@ namespace Stacking
         private CraneSignal Compute()
         {
             if (association == null || !association.RolesAssigned)
-            { previous.Clear(); return CraneSignal.None; }
+            { previous.Clear(); lastHeldHand = CraneSignal.Hand.None; return CraneSignal.None; }
 
             association.GetHandsForRole(ParticipantHandAssociation.ParticipantRole.Parent, scratch);
-            if (scratch.Count == 0) { previous.Clear(); return CraneSignal.None; }
+            if (scratch.Count == 0) { previous.Clear(); lastHeldHand = CraneSignal.Hand.None; return CraneSignal.None; }
 
             // Anatomical: image-left == parent's own right.
             scratch.Sort((a, b) => a.Center.x.CompareTo(b.Center.x));
@@ -73,8 +74,8 @@ namespace Stacking
             if (stale != null)
                 for (int i = 0; i < stale.Count; i++) previous.Remove(stale[i]);
 
-            if (raise) lastRaiseTime = Time.time;
-            return new CraneSignal(raise, true, raisingHand);
+            if (raise) { lastRaiseTime = Time.time; lastHeldHand = raisingHand; }
+            return new CraneSignal(raise, true, lastHeldHand);
         }
 
         private static bool SignalsEqual(CraneSignal a, CraneSignal b)

@@ -18,6 +18,17 @@ namespace Stacking
         [SerializeField] private BlockSweepController sweep;
         [SerializeField] private TiltMatchView matchView;
 
+        [Header("Round gating")]
+        [Tooltip("If false, the director will NOT auto-spawn the first block. Call BeginRound() to arm it. " +
+                 "Leave this ON for standalone testing of the scene without KidsSalonGameFlow; " +
+                 "KidsSalonGameFlow turns it on automatically when a round starts.")]
+        [SerializeField] private bool armed = false;
+
+        [Tooltip("If the game reports not moving for this long AFTER a round is armed and a block " +
+                 "has already been spawned and destroyed, spawn a replacement. Prevents the " +
+                 "double-spawn you got when RestartGame briefly reports IsMoving == false.")]
+        [SerializeField, Min(0f)] private float respawnGraceSeconds = 0.15f;
+
         [Header("Guiding detection")]
         [SerializeField, Range(0.02f, 0.5f)] private float guideEnterDistance = 0.12f;
         [SerializeField, Range(0.02f, 0.6f)] private float guideExitDistance = 0.18f;
@@ -42,9 +53,12 @@ namespace Stacking
         public bool ParentPresent => Crane.HasHand;
         public CraneSignal.Hand ParentRaisingHand => Crane.RaisingHand;
 
+        public bool IsArmed => armed;
+
         public event Action<Phase> PhaseChanged;
 
         private bool _firstSpawnDone;
+        private float _notMovingSince = -1f;
 
         private void Awake()
         {
@@ -69,6 +83,29 @@ namespace Stacking
             if (childHands != null) childHands.Placed -= OnChildPlaced;
         }
 
+        /// <summary>
+        /// Called by KidsSalonGameFlow (or any host) when a round officially starts.
+        /// From that moment the director will keep a block moving. Before that it
+        /// will do nothing, so no stray blocks appear before the game begins.
+        /// </summary>
+        public void BeginRound()
+        {
+            armed = true;
+            _firstSpawnDone = false;
+            _notMovingSince = -1f;
+        }
+
+        /// <summary>
+        /// Called when a round ends or is torn down. Clears the armed flag so the
+        /// next scene / next round starts clean.
+        /// </summary>
+        public void EndRound()
+        {
+            armed = false;
+            _firstSpawnDone = false;
+            _notMovingSince = -1f;
+        }
+
         private void Update()
         {
             if (PauseOverlay.IsPaused) return;
@@ -84,9 +121,38 @@ namespace Stacking
 
         private void EnsureFirstBlockSpawned()
         {
+            if (!armed) return;
             if (stackGame == null || stackGame.IsGameOver) return;
-            if (!stackGame.IsMoving)
+
+            if (stackGame.IsMoving)
+            {
+                _firstSpawnDone = true;
+                _notMovingSince = -1f;
+                return;
+            }
+
+            // Not moving. If we've never spawned, spawn immediately (this is
+            // the normal "first block" path).
+            if (!_firstSpawnDone)
+            {
                 stackGame.SpawnBlock();
+                _firstSpawnDone = true;
+                _notMovingSince = -1f;
+                return;
+            }
+
+            // We've spawned before, and the game briefly reports not moving
+            // (e.g. right after RestartGame, or during block settle). Wait a
+            // grace period before spawning another, so we don't spawn a
+            // duplicate during reset.
+            if (_notMovingSince < 0f)
+                _notMovingSince = Time.unscaledTime;
+
+            if (Time.unscaledTime - _notMovingSince < respawnGraceSeconds)
+                return;
+
+            stackGame.SpawnBlock();
+            _notMovingSince = -1f;
         }
 
         private void UpdateGuidingState()
@@ -94,7 +160,7 @@ namespace Stacking
             if (!Head.HasFace || !Monster.HasAny) { BarberGuiding = false; return; }
 
             float nearest = float.MaxValue;
-            if (Monster.Left.IsBound)  nearest = Mathf.Min(nearest, Vector2.Distance(Monster.Left.Center, Head.Center));
+            if (Monster.Left.IsBound) nearest = Mathf.Min(nearest, Vector2.Distance(Monster.Left.Center, Head.Center));
             if (Monster.Right.IsBound) nearest = Mathf.Min(nearest, Vector2.Distance(Monster.Right.Center, Head.Center));
 
             float threshold = BarberGuiding ? guideExitDistance : guideEnterDistance;
@@ -135,9 +201,7 @@ namespace Stacking
             else if (stackGame.IsGameOver) next = Phase.GameOver;
             else if (!Head.HasFace) next = Phase.WaitingForChild;
             else if (!Monster.HasAny) next = Phase.WaitingForBarber;
-            else if (!Crane.HasHand) next = Phase.WaitingForParent;
             else next = Phase.Playing;
-
             if (next == CurrentPhase) return;
             CurrentPhase = next;
             PhaseChanged?.Invoke(next);
@@ -150,7 +214,9 @@ namespace Stacking
         {
             Crane = signal;
             if (stackGame == null || stackGame.IsGameOver) return;
-            sweep?.Steer(signal.HasHand ? signal.RaisingHand : CraneSignal.Hand.None);
+            if (sweep == null) return;
+            if (signal.HasHand && signal.RaisingHand != CraneSignal.Hand.None) sweep.Steer(signal.RaisingHand);
+            else if (!signal.HasHand) sweep.ReleaseSteer();
         }
 
         private void OnChildPlaced()

@@ -8,7 +8,7 @@ namespace Stacking
     public class ChildHandsInput : MonoBehaviour
     {
         [SerializeField] private ParticipantHandAssociation association;
-        [SerializeField, Range(0.01f, 0.3f)] private float raiseDistance = 0.09f;
+        [SerializeField, Range(0.001f, 0.3f)] private float raiseDistance = 0.005f;
         [SerializeField] private bool requiresOpenHand = true;
         [SerializeField, Min(0.1f)] private float raiseCooldown = 0.6f;
 

@@ -17,6 +17,11 @@ namespace AR.Vision
     ///
     /// This means the game still works with 1, 2 or 3 people: the demo
     /// operator binds the roles explicitly from RoleAssignmentPanel.
+    ///
+    /// Public read-only snapshot APIs (GetBinding / GetAllBindings / NextFaceId)
+    /// exist so HUD / gameplay code can display "who is who" without poking
+    /// at private dictionaries. The RoleChanged event fires on every change
+    /// of a single role (auto or manual) so UIs can react immediately.
     /// </summary>
     public class ParticipantHandAssociation : MonoBehaviour
     {
@@ -27,15 +32,40 @@ namespace AR.Vision
             Parent
         }
 
+        /// <summary>
+        /// Immutable snapshot of one role binding, safe to hand to UI code.
+        /// FaceTrackId is -1 when unbound.
+        /// </summary>
+        public readonly struct RoleBinding
+        {
+            public readonly ParticipantRole Role;
+            public readonly int FaceTrackId;
+            public readonly bool IsManual;
+            public readonly string Label;
+
+            public RoleBinding(ParticipantRole role, int faceTrackId, bool isManual, string label)
+            {
+                Role = role;
+                FaceTrackId = faceTrackId;
+                IsManual = isManual;
+                Label = label ?? string.Empty;
+            }
+
+            public bool IsBound => FaceTrackId >= 0;
+        }
+
         [Header("Vision")]
         [SerializeField] private VisionPipeline vision;
 
         [Header("Participant assignment")]
         [Tooltip("Number of faces required before AUTO assigning the three roles. Manual assignment works with any number.")]
-        [SerializeField, Range(1, 3)] private int requiredParticipants = 3;
+        [SerializeField, Range(1, 3)] private int requiredParticipants = 2;
 
         [Tooltip("Reassign roles when a previously assigned face disappears.")]
         [SerializeField] private bool reassignWhenFaceLost = true;
+
+        [Tooltip("When a face is lost and other faces are still tracked, re-run auto assignment immediately to refill the empty slot (only affects roles that are not manually bound).")]
+        [SerializeField] private bool autoRefillOnFaceLost = true;
 
         [Header("Hand association")]
         [Tooltip("Maximum normalized distance between a hand and face to allow association.")]
@@ -53,6 +83,13 @@ namespace AR.Vision
         public bool RolesAssigned { get; private set; }
 
         public event Action RolesAssignedEvent;
+
+        /// <summary>Fires for a single role whenever its binding changes. Carries the new snapshot.</summary>
+        public event Action<RoleBinding> RoleChanged;
+
+        /// <summary>Fires when RolesAssigned flips from false to true or true to false.</summary>
+        public event Action<bool> RolesAssignedChanged;
+
         public event Action<int, ParticipantRole> HandAssociated;
         public event Action<int> HandUnassociated;
 
@@ -79,6 +116,13 @@ namespace AR.Vision
             new HashSet<ParticipantRole>();
 
         private bool subscribed;
+
+        private static readonly ParticipantRole[] AllRoles =
+        {
+            ParticipantRole.Child,
+            ParticipantRole.Barber,
+            ParticipantRole.Parent,
+        };
 
         // ---------------------------------------------------------------
         // Lifecycle
@@ -176,7 +220,13 @@ namespace AR.Vision
             faceRoles.Remove(trackId);
             bool wasManual = manualRoles.Contains(role);
 
-            if (!reassignWhenFaceLost) return;
+            NotifyRoleChanged(role);
+
+            if (!reassignWhenFaceLost)
+            {
+                RefreshRolesAssignedFlag();
+                return;
+            }
 
             if (wasManual)
             {
@@ -184,17 +234,27 @@ namespace AR.Vision
                 // re-bind without clearing first.
                 if (logAssignments)
                     Debug.Log("Manual role " + role + " face lost. Waiting for rebind.", this);
+                RefreshRolesAssignedFlag();
                 return;
             }
 
-            RolesAssigned = faceRoles.Count > 0;
-            if (RolesAssigned) return;
+            // Auto path: if a slot is now empty and other faces are still
+            // tracked, try to refill it immediately instead of waiting for a
+            // brand new face to appear.
+            if (autoRefillOnFaceLost && !RolesAssigned)
+                TryAutoAssignRoles();
+            else if (autoRefillOnFaceLost)
+                TryRefillEmptyAutoRoles();
 
-            faceRoles.Clear();
-            ClearHands();
+            RefreshRolesAssignedFlag();
 
-            if (logAssignments)
-                Debug.Log("Participant face lost. Waiting to assign roles again.", this);
+            if (!RolesAssigned && faceRoles.Count == 0)
+            {
+                faceRoles.Clear();
+                ClearHands();
+                if (logAssignments)
+                    Debug.Log("Participant face lost. Waiting to assign roles again.", this);
+            }
         }
 
         // ---------------------------------------------------------------
@@ -207,43 +267,60 @@ namespace AR.Vision
             if (faces.Count < requiredParticipants) return;
             if (manualRoles.Count >= 3) return;   // all roles manual: never auto
 
+            AssignAutoRoles();
+        }
+
+        /// <summary>
+        /// Refills any role that is currently unbound AND not manually bound,
+        /// using unbound tracked faces in left-to-right order. Used when a
+        /// face is lost but other faces remain.
+        /// </summary>
+        private void TryRefillEmptyAutoRoles()
+        {
+            if (manualRoles.Count >= 3) return;
+
+            // Which roles are currently unbound?
+            bool anyEmpty = false;
+            for (int i = 0; i < AllRoles.Length; i++)
+            {
+                if (manualRoles.Contains(AllRoles[i])) continue;
+                if (GetFaceIdForRoleInternal(AllRoles[i]) < 0) { anyEmpty = true; break; }
+            }
+            if (!anyEmpty) return;
+            if (faces.Count == 0) return;
+
+            AssignAutoRoles();
+        }
+
+        private void AssignAutoRoles()
+        {
             List<Observation> sorted = new List<Observation>(faces.Values);
             sorted.Sort((a, b) => a.Center.x.CompareTo(b.Center.x));
-
-            // Fill any role that isn't already manually bound, in order.
-            ParticipantRole[] order =
-            {
-                ParticipantRole.Child,
-                ParticipantRole.Barber,
-                ParticipantRole.Parent,
-            };
-
             int faceIndex = 0;
-            foreach (ParticipantRole role in order)
+            foreach (ParticipantRole role in AllRoles)
             {
                 if (manualRoles.Contains(role)) continue;
+                if (GetFaceIdForRoleInternal(role) >= 0) continue;
+                while (faceIndex < sorted.Count && faceRoles.ContainsKey(sorted[faceIndex].TrackId)) faceIndex++;
                 if (faceIndex >= sorted.Count) break;
-
-                // Skip faces already bound to another role.
-                while (faceIndex < sorted.Count &&
-                       faceRoles.ContainsKey(sorted[faceIndex].TrackId))
-                {
-                    faceIndex++;
-                }
-                if (faceIndex >= sorted.Count) break;
-
-                faceRoles[sorted[faceIndex].TrackId] = role;
+                int faceId = sorted[faceIndex].TrackId;
+                faceRoles[faceId] = role;
                 faceIndex++;
+                NotifyRoleChanged(role);
             }
+            RefreshRolesAssignedFlag();
+            if (logAssignments) Debug.Log("Participant roles auto-assigned (manual: " + manualRoles.Count + ").", this);
+        }
 
-            if (faceRoles.Count == 0) return;
-
-            RolesAssigned = true;
-
-            if (logAssignments)
-                Debug.Log("Participant roles auto-assigned (manual: " + manualRoles.Count + ").", this);
-
-            RolesAssignedEvent?.Invoke();
+        /// <summary>
+        /// Manual trigger for auto-assignment. Useful from a UI button or a
+        /// debug key. Respects manual bindings.
+        /// </summary>
+        public void AutoAssignNow()
+        {
+            if (manualRoles.Count >= 3) return;
+            if (faces.Count == 0) return;
+            AssignAutoRoles();
         }
 
         // ---------------------------------------------------------------
@@ -271,13 +348,7 @@ namespace AR.Vision
                 for (int i = 0; i < toClear.Count; i++) faceRoles.Remove(toClear[i]);
 
             // Clear anyone currently in this role.
-            int previousId = -1;
-            foreach (KeyValuePair<int, ParticipantRole> pair in faceRoles)
-            {
-                if (pair.Value == role) { previousId = pair.Key; break; }
-            }
-            if (previousId >= 0 && previousId != faceTrackId)
-                faceRoles.Remove(previousId);
+            int previousId = GetFaceIdForRoleInternal(role);
 
             if (faceTrackId < 0)
             {
@@ -286,17 +357,19 @@ namespace AR.Vision
             }
             else
             {
+                if (previousId >= 0 && previousId != faceTrackId)
+                    faceRoles.Remove(previousId);
+
                 faceRoles[faceTrackId] = role;
                 manualRoles.Add(role);
             }
 
-            RolesAssigned = faceRoles.Count > 0;
+            NotifyRoleChanged(role);
+            RefreshRolesAssignedFlag();
 
             if (logAssignments)
                 Debug.Log("Manual role " + role + " -> face " + faceTrackId
                     + " (assigned: " + RolesAssigned + ")", this);
-
-            RolesAssignedEvent?.Invoke();
         }
 
         /// <summary>
@@ -330,6 +403,10 @@ namespace AR.Vision
 
             if (logAssignments)
                 Debug.Log("Manual roles cleared; auto-assignment re-enabled.", this);
+
+            // Re-run auto so the player sees an immediate effect.
+            if (faces.Count >= requiredParticipants)
+                AssignAutoRoles();
         }
 
         /// <summary>Returns true if the given role was bound by a human.</summary>
@@ -337,6 +414,9 @@ namespace AR.Vision
 
         /// <summary>Snapshot of the current face id for a role, or -1.</summary>
         public int GetFaceIdForRole(ParticipantRole role)
+            => GetFaceIdForRoleInternal(role);
+
+        private int GetFaceIdForRoleInternal(ParticipantRole role)
         {
             foreach (KeyValuePair<int, ParticipantRole> pair in faceRoles)
                 if (pair.Value == role) return pair.Key;
@@ -348,6 +428,53 @@ namespace AR.Vision
         {
             List<Observation> list = new List<Observation>(faces.Values);
             return list;
+        }
+
+        /// <summary>Immutable snapshot of a role binding, safe to hand to UI.</summary>
+        public RoleBinding GetBinding(ParticipantRole role)
+        {
+            int faceId = GetFaceIdForRoleInternal(role);
+            string label = string.Empty;
+            if (faceId >= 0 && faces.TryGetValue(faceId, out Observation face))
+                label = face.Label;
+
+            return new RoleBinding(role, faceId, manualRoles.Contains(role), label);
+        }
+
+        /// <summary>All three bindings in role order Child, Barber, Parent.</summary>
+        public void GetAllBindings(List<RoleBinding> results)
+        {
+            if (results == null) return;
+            results.Clear();
+            for (int i = 0; i < AllRoles.Length; i++)
+                results.Add(GetBinding(AllRoles[i]));
+        }
+
+        /// <summary>Returns the face that is NOT currently bound to any role, or -1.</summary>
+        public int NextUnboundFaceId()
+        {
+            foreach (KeyValuePair<int, Observation> pair in faces)
+                if (!faceRoles.ContainsKey(pair.Key)) return pair.Key;
+            return -1;
+        }
+
+        // ---------------------------------------------------------------
+        // Internal change notification
+        // ---------------------------------------------------------------
+
+        private void NotifyRoleChanged(ParticipantRole role)
+        {
+            RoleChanged?.Invoke(GetBinding(role));
+            RolesAssignedEvent?.Invoke();
+        }
+
+        private void RefreshRolesAssignedFlag()
+        {
+            bool next = faceRoles.Count > 0;
+            if (next == RolesAssigned) return;
+
+            RolesAssigned = next;
+            RolesAssignedChanged?.Invoke(next);
         }
 
         // ---------------------------------------------------------------
